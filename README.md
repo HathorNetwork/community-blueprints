@@ -15,7 +15,7 @@ This repository is for community-submitted blueprints awaiting review and approv
 1. Create a pull request targeting the `master` branch with your new blueprint
    - The pull request must contain a single file with the blueprint code
    - The file should be placed in the `blueprints/` directory
-   - Follow the naming convention: `your-blueprint-name.py`
+   - Follow the naming convention: `your_blueprint_name.py`
    - The PR description must explain the blueprint's purpose and functionality
 2. Track your submission in the [GitHub Project](https://github.com/orgs/HathorNetwork/projects/24/views/1)
 
@@ -24,7 +24,7 @@ This repository is for community-submitted blueprints awaiting review and approv
 Your pull request should add a file to the `blueprints/` directory:
 ```
 blueprints/
-└── your-blueprint-name.py
+└── your_blueprint_name.py
 ```
 
 ### Review Process
@@ -45,11 +45,11 @@ We will link the explorer URL of your blueprint in a comment on the pull request
 
 No, each pull request should contain only a single blueprint file. If you want to submit multiple blueprints, please create separate pull requests for each one.
 
-**Can I update an existing blueprint?**
+**Can I change an existing blueprint?**
 
-If the blueprint is still in the review queue (pull request not yet merged), you can update it as much as you want by pushing new commits to your PR branch.
+If the blueprint is still in the review queue (pull request not yet merged), you can change it as much as you want by pushing new commits to your PR branch.
 
-Once a blueprint has been approved and pushed to the network, it becomes immutable and cannot be updated. If you need to make changes, you would need to submit a new blueprint with a different name.
+Once a blueprint has been approved and pushed to the network, it becomes immutable and cannot be changed. However, your original code could use upgradable Blueprint features that may allow a contract to be pointed to a new Blueprint or to make proxy (delegate) calls to other Blueprints.
 
 **What happens if my blueprint is rejected?**
 
