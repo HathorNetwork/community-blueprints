@@ -13,18 +13,21 @@ This repository is for community-submitted blueprints awaiting review and approv
 ## Submission Process
 
 1. Create a pull request targeting the `master` branch with your new blueprint
-   - The pull request must contain a single file with the blueprint code
-   - The file should be placed in the `blueprints/` directory
+   - The pull request must contain a single blueprint submission
+   - The file should be placed in the `blueprints/your_blueprint_name/` directory
    - Follow the naming convention: `your_blueprint_name.py`
    - The PR description must explain the blueprint's purpose and functionality
+   - You can add other files that may help the review, e.g., test file, markdown with detailed description.
 2. Track your submission in the [GitHub Project](https://github.com/orgs/HathorNetwork/projects/24/views/1)
 
 ### Example Structure
 
-Your pull request should add a file to the `blueprints/` directory:
+Your pull request should add a folder to the `blueprints/` directory with the files:
 ```
 blueprints/
-└── your_blueprint_name.py
+└── your_blueprint_name/
+    ├── your_blueprint_name.py
+    └── tests.py
 ```
 
 ### Review Process
