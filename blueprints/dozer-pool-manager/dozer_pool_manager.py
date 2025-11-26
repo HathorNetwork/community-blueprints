@@ -679,12 +679,9 @@ class DozerPoolManager(Blueprint):
         """
         a = fee_denominator - fee_numerator
         b = fee_denominator
-        if amount_out >= reserve_out:
-            amount_in = self.quote(amount_out, reserve_out, reserve_in)
-        else:
-            amount_in = (
-                reserve_in * amount_out * b + (reserve_out - amount_out) * a - 1
-            ) // ((reserve_out - amount_out) * a)
+        amount_in = (
+            reserve_in * amount_out * b + (reserve_out - amount_out) * a - 1
+        ) // ((reserve_out - amount_out) * a)
         return Amount(amount_in)
 
     @view
@@ -2587,6 +2584,10 @@ class DozerPoolManager(Blueprint):
                 reserve_in = pool.reserve_b
                 reserve_out = pool.reserve_a
 
+            # Validate sufficient liquidity
+            if amount_out >= reserve_out:
+                raise InsufficientLiquidity("Insufficient funds")
+
             # Get the fee for this pool
             fee = pool.fee_numerator
             fee_denominator = pool.fee_denominator
@@ -2685,6 +2686,10 @@ class DozerPoolManager(Blueprint):
                 second_reserve_in = second_pool.reserve_b
                 second_reserve_out = second_pool.reserve_a
 
+            # Validate sufficient liquidity for second hop
+            if amount_out >= second_reserve_out:
+                raise InsufficientLiquidity("Insufficient funds in second pool")
+
             second_fee = second_pool.fee_numerator
             second_fee_denominator = second_pool.fee_denominator
 
@@ -2705,6 +2710,10 @@ class DozerPoolManager(Blueprint):
             else:
                 first_reserve_in = first_pool.reserve_b
                 first_reserve_out = first_pool.reserve_a
+
+            # Validate sufficient liquidity for first hop
+            if intermediate_amount >= first_reserve_out:
+                raise InsufficientLiquidity("Insufficient funds in first pool")
 
             first_fee = first_pool.fee_numerator
             first_fee_denominator = first_pool.fee_denominator
@@ -2821,6 +2830,10 @@ class DozerPoolManager(Blueprint):
                 third_reserve_in = third_pool.reserve_b
                 third_reserve_out = third_pool.reserve_a
 
+            # Validate sufficient liquidity for third hop
+            if amount_out >= third_reserve_out:
+                raise InsufficientLiquidity("Insufficient funds in third pool")
+
             third_fee = third_pool.fee_numerator
             third_fee_denominator = third_pool.fee_denominator
 
@@ -2842,6 +2855,10 @@ class DozerPoolManager(Blueprint):
                 second_reserve_in = second_pool.reserve_b
                 second_reserve_out = second_pool.reserve_a
 
+            # Validate sufficient liquidity for second hop
+            if second_intermediate_amount >= second_reserve_out:
+                raise InsufficientLiquidity("Insufficient funds in second pool")
+
             second_fee = second_pool.fee_numerator
             second_fee_denominator = second_pool.fee_denominator
 
@@ -2862,6 +2879,10 @@ class DozerPoolManager(Blueprint):
             else:
                 first_reserve_in = first_pool.reserve_b
                 first_reserve_out = first_pool.reserve_a
+
+            # Validate sufficient liquidity for first hop
+            if first_intermediate_amount >= first_reserve_out:
+                raise InsufficientLiquidity("Insufficient funds in first pool")
 
             first_fee = first_pool.fee_numerator
             first_fee_denominator = first_pool.fee_denominator
