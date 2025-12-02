@@ -916,10 +916,10 @@ class DozerPoolManager(Blueprint):
         """
         a = fee_denominator - fee_numerator
         b = fee_denominator
-        amount_in = (
-            reserve_in * amount_out * b + (reserve_out - amount_out) * a - 1
-        ) // ((reserve_out - amount_out) * a)
-        return Amount(amount_in)
+        numerator = Amount(reserve_in * amount_out * b)
+        denominator = Amount((reserve_out - amount_out) * a)
+        amount_in = self._ceil_div(numerator, denominator)
+        return amount_in
 
     @view
     def front_quote_add_liquidity_in(
@@ -1630,7 +1630,6 @@ class DozerPoolManager(Blueprint):
             reserve_in = pool.reserve_a
             reserve_out = pool.reserve_b
         else:
-            assert token_in == pool.token_b, f"Token {token_in} is not part of pool {pool_key}"
             reserve_in = pool.reserve_b
             reserve_out = pool.reserve_a
 
@@ -1780,7 +1779,6 @@ class DozerPoolManager(Blueprint):
             reserve_in = reserve_a
             reserve_out = reserve_b
         else:
-            assert token_in == token_b, f"Token {token_in} is not part of pool"
             reserve_in = reserve_b
             reserve_out = reserve_a
 
@@ -1883,7 +1881,6 @@ class DozerPoolManager(Blueprint):
                 reserve_a_after = Amount(new_reserve_a - extra_a)
                 reserve_b_after = Amount(new_reserve_b + amount_b)
             else:
-                assert token_out == token_b, f"Token {token_out} is not part of pool"
                 total_amount_out = amount_a
                 swap_amount = Amount(0)
                 swap_output = Amount(0)
@@ -2176,10 +2173,10 @@ class DozerPoolManager(Blueprint):
         min_accepted_amount = Amount(action_out.amount)
 
         amount_in = action_in_amount
-        fee_amount = Amount((
-            amount_in * pool.fee_numerator
-            + pool.fee_denominator - 1
-        ) // pool.fee_denominator)
+        fee_amount = self._ceil_div(
+            Amount(amount_in * pool.fee_numerator),
+            Amount(pool.fee_denominator)
+        )
 
         # Update accumulated fee
         accumulated_fee = self.pool_accumulated_fee[pool_key]
@@ -2323,19 +2320,19 @@ class DozerPoolManager(Blueprint):
         )
 
         # Calculate fee amount
-        fee_amount = (
-            amount_in * pool.fee_numerator
-            + pool.fee_denominator - 1
-        ) // pool.fee_denominator
+        fee_amount = self._ceil_div(
+            Amount(amount_in * pool.fee_numerator),
+            Amount(pool.fee_denominator)
+        )
 
         # Update accumulated fee
         accumulated_fee = self.pool_accumulated_fee[pool_key]
-        accumulated_fee[action_in.token_uid] = (
+        accumulated_fee[action_in.token_uid] = Amount(
             accumulated_fee.get(action_in.token_uid, 0) + fee_amount
         )
 
         # Calculate protocol fee
-        protocol_fee_amount = fee_amount * self.default_protocol_fee // 100
+        protocol_fee_amount = Amount(fee_amount * self.default_protocol_fee // 100)
 
         # Calculate liquidity increase for protocol fee
         liquidity_increase = self._get_protocol_liquidity_increase(
