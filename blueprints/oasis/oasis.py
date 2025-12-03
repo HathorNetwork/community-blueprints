@@ -115,7 +115,7 @@ class Oasis(Blueprint):
         dozer_pool_manager: ContractId,
         token_b: TokenUid,
         pool_fee: Amount,
-        protocol_fee: Amount,
+        protocol_fee: int,
     ) -> None:
         """Initialize the contract with dozer pool manager set."""
         self.contract_version = "1.0.0"
@@ -131,7 +131,7 @@ class Oasis(Blueprint):
         self.oasis_htr_balance = Amount(action.amount)
         self.dev_deposit_amount = Amount(action.amount)
         self.total_liquidity = Amount(0)
-        self.protocol_fee = protocol_fee
+        self.protocol_fee = Amount(protocol_fee)
         self.owner_address = Address(ctx.caller_id)
 
         # Initialize all dict fields
@@ -478,7 +478,7 @@ class Oasis(Blueprint):
         self.user_balances[Address(ctx.caller_id)] = partial
 
     @public
-    def update_protocol_fee(self, ctx: Context, new_fee: Amount) -> None:
+    def update_protocol_fee(self, ctx: Context, new_fee: int) -> None:
         """Update the protocol fee percentage (in thousandths).
 
         Args:
@@ -493,7 +493,7 @@ class Oasis(Blueprint):
         if new_fee > 1000 or new_fee < 0:
             raise NCFail("Protocol fee cannot exceed 100%")
 
-        self.protocol_fee = new_fee
+        self.protocol_fee = Amount(new_fee)
 
     def _get_oasis_lp_amount_b(self) -> Amount:
         # Get user info for this contract from the pool manager
