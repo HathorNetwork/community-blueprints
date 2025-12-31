@@ -21,6 +21,7 @@ For Localnet verification steps and transaction links, see: **`localnet_testflow
 - `test_otc_escrow_swap.py` — Automated unit test suite (Blueprint SDK / `BlueprintTestCase`)
 - `spec.md` — Authoritative specification (final)
 - `localnet_testflow.md` — Localnet integration test flow & results
+- `USE_CASES.md` — Design-informed intended use-cases and scope boundaries
 
 ---
 
@@ -28,6 +29,17 @@ For Localnet verification steps and transaction links, see: **`localnet_testflow
 
 ### Purpose
 The blueprint provides a **trust-minimized, on-chain escrow mechanism** for OTC swaps (no order book / AMM / oracle), with deterministic settlement rules and safe recovery paths.
+
+### Intended Use-Cases
+
+This blueprint is designed as a **general-purpose OTC settlement primitive**.
+The use-cases considered during design are documented in
+`USE_CASES.md` (see ./USE_CASES.md).
+
+These use-cases are **illustrative rather than exhaustive**, and are intended
+to clarify when bilateral, deterministic escrow is preferable to AMM-based
+execution (e.g., due to liquidity, price impact, or confidentiality
+constraints).
 
 ### Roles
 - Owner — caller identity at `initialize()`
