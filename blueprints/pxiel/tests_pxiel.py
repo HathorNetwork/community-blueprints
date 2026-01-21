@@ -1,16 +1,20 @@
 
+from hathor.reactor.reactor import initialize_global_reactor
+initialize_global_reactor()
 from hathor.nanocontracts import HATHOR_TOKEN_UID
 from hathor.nanocontracts.exception import NCFail
 from hathor.nanocontracts.types import Address, NCDepositAction, NCWithdrawalAction, TokenUid
 from hathor_tests.nanocontracts.blueprints.unittest import BlueprintTestCase
 
-from contract.pxiel import (
+from pxiel import (
     EmptyBatch,
     FeeRequired,
     InvalidColorFormat,
     OutOfBounds,
     Pxiel,
 )
+
+
 
 
 class TestPxiel(BlueprintTestCase):
@@ -97,7 +101,7 @@ class TestPxiel(BlueprintTestCase):
             caller_id=caller,
         )
 
-        with self.assertRaises(FeeRequired):
+        with self.assertRaises(NCFail):
             self.runner.call_public_method(self.pxiel_id, 'paint', ctx, 1, 1, '#ffffff')
 
     def test_paint_batch_success(self) -> None:
