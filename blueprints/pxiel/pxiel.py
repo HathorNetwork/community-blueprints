@@ -99,6 +99,7 @@ class Pxiel(Blueprint):
     def paint(self, ctx: Context, x: int, y: int, color: str) -> None:
    
         action = ctx.get_single_action(HATHOR_TOKEN_UID)
+        assert len(ctx.actions) == 1, 'expected only one token'
         if not isinstance(action, NCDepositAction):
             raise FeeRequired("An HTR deposit is required to paint.")
 
