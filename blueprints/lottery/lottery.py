@@ -184,7 +184,7 @@ class Lottery(Blueprint):
         self.syscall.emit_event(event_data.encode("utf-8"))
 
     @view
-    def get_state(self) -> dict:
+    def get_state(self) -> dict[str, str | int]:
         return {
             "description": self.description,
             "price": self.price,
