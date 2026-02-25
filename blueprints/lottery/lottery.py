@@ -184,14 +184,14 @@ class Lottery(Blueprint):
         self.syscall.emit_event(event_data.encode("utf-8"))
 
     @view
-    def get_state(self) -> dict[str, str | int]:
+    def get_state(self) -> dict[str, str]:
         return {
             "description": self.description,
-            "price": self.price,
-            "commission": self.commission,
-            "pot": self.pot,
+            "price": str(self.price),
+            "commission": str(self.commission),
+            "pot": str(self.pot),
             "state": self.state,
             "creator": self.creator.hex(),
-            "participant_count": len(self.participants),
+            "participant_count": str(len(self.participants)),
             "winner": self.winner.hex() if self.state == "CLOSED" else "",
         }
