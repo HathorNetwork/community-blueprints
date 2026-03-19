@@ -9,6 +9,7 @@ from hathor import (
     TokenUid,
     Timestamp,
     export,
+    json_dumps,
     public,
     view,
 )
@@ -230,9 +231,15 @@ class Polls(Blueprint):
 
         self.poll_count += 1
 
-        event_data = (
-            f'{{"event":"PollCreated","id":{poll_id},"token":"{token_uid.hex()}",'
-            f'"start":{start_at},"end":{end_at},"weighting":"{weighting}"}}'
+        event_data = json_dumps(
+            {
+                "event": "PollCreated",
+                "id": poll_id,
+                "token": token_uid.hex(),
+                "start": start_at,
+                "end": end_at,
+                "weighting": weighting,
+            }
         )
         self.syscall.emit_event(event_data.encode("utf-8"))
 
@@ -283,9 +290,14 @@ class Polls(Blueprint):
         self.poll_result_weight[option_key] = self.poll_result_weight.get(option_key, 0) + weight
         self.poll_result_votes[option_key] = self.poll_result_votes.get(option_key, 0) + 1
 
-        event_data = (
-            f'{{"event":"VoteCast","id":{poll_id},"option":{option_index},'
-            f'"weight":{weight},"amount":{amount}}}'
+        event_data = json_dumps(
+            {
+                "event": "VoteCast",
+                "id": poll_id,
+                "option": option_index,
+                "weight": weight,
+                "amount": amount,
+            }
         )
         self.syscall.emit_event(event_data.encode("utf-8"))
 
@@ -319,8 +331,12 @@ class Polls(Blueprint):
 
         self.vote_withdrawn[vote_index] = self.vote_withdrawn[vote_index] + amount
 
-        event_data = (
-            f'{{"event":"VoteWithdrawn","id":{poll_id},"amount":{amount}}}'
+        event_data = json_dumps(
+            {
+                "event": "VoteWithdrawn",
+                "id": poll_id,
+                "amount": amount,
+            }
         )
         self.syscall.emit_event(event_data.encode("utf-8"))
 
@@ -337,8 +353,11 @@ class Polls(Blueprint):
 
         self.creation_fee_balance_htr -= amount
 
-        event_data = (
-            f'{{"event":"CreationFeeWithdrawn","amount":{amount}}}'
+        event_data = json_dumps(
+            {
+                "event": "CreationFeeWithdrawn",
+                "amount": amount,
+            }
         )
         self.syscall.emit_event(event_data.encode("utf-8"))
 
