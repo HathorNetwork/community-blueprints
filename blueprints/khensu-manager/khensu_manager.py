@@ -58,6 +58,13 @@ class TransactionDenied(NCFail):
 # Constants
 BASIS_POINTS = 10000
 FEE_TOKEN_VALUE = 1
+MAX_FEE_RATE = 1000  # Maximum buy/sell/creator fee rate in basis points (10%)
+MAX_POOL_FEE_RATE = 50
+MAX_NAME_LENGTH = 30
+MAX_SYMBOL_LENGTH = 5
+MAX_DESCRIPTION_LENGTH = 500
+NAME_ALLOWED_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
+SYMBOL_ALLOWED_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 
 class PlatformInfo(NamedTuple):
@@ -207,6 +214,18 @@ class KhensuManager(Blueprint):
         self.admin_set = {caller_address}
         self.dozer_pool_manager_id = dozer_pool_manager_id
 
+        # Validate fee rates and cache capacity
+        if not 0 <= buy_fee_rate <= MAX_FEE_RATE:
+            raise InvalidParameters("Invalid buy fee rate")
+        if not 0 <= sell_fee_rate <= MAX_FEE_RATE:
+            raise InvalidParameters("Invalid sell fee rate")
+        if not 0 <= creator_fee_rate <= MAX_FEE_RATE:
+            raise InvalidParameters("Invalid creator fee rate")
+        if not 0 <= default_pool_fee_rate <= MAX_POOL_FEE_RATE:
+            raise InvalidParameters("Invalid pool fee rate")
+        if lru_cache_capacity <= 0:
+            raise InvalidParameters("LRU cache capacity must be positive")
+
         # Default parameters for new tokens
         self.buy_fee_rate = buy_fee_rate
         self.sell_fee_rate = sell_fee_rate
@@ -216,15 +235,15 @@ class KhensuManager(Blueprint):
         self.default_graduation_fee = default_graduation_fee
         self.default_token_total_supply = default_token_total_supply
 
-        constant_a = 16 * default_token_total_supply * default_target_market_cap
-        constant_b = (default_target_market_cap + 5 * default_graduation_fee) * (
-            default_target_market_cap + 5 * default_graduation_fee
+        # Validate curve parameters and compute constants
+        constant_a, constant_b, constant_c = self._compute_curve_constants(
+            default_target_market_cap,
+            default_token_total_supply,
+            default_graduation_fee,
         )
-        constant_c = 5 * (3 * default_target_market_cap - 5 * default_graduation_fee)
-
-        self.default_constant_a = Amount(constant_a)
-        self.default_constant_b = Amount(constant_b)
-        self.default_constant_c = Amount(constant_c)
+        self.default_constant_a = constant_a
+        self.default_constant_b = constant_b
+        self.default_constant_c = constant_c
 
         # Platform statistics
         self.total_tokens_created = 0
@@ -251,6 +270,36 @@ class KhensuManager(Blueprint):
         self.tokens = {}
         self.user_balance_tokens = {}
         self.user_balances = {}
+
+    def _compute_curve_constants(
+        self,
+        target_market_cap: Amount,
+        total_supply: Amount,
+        graduation_fee: Amount,
+    ) -> tuple[Amount, Amount, Amount]:
+        """Validate bonding-curve parameters and compute constants a, b, c.
+
+        Raises InvalidParameters if the parameters would produce a degenerate
+        curve.
+        """
+        if target_market_cap <= 0:
+            raise InvalidParameters("Invalid target market cap")
+        if total_supply <= 0:
+            raise InvalidParameters("Invalid token amount")
+        if graduation_fee < FEE_TOKEN_VALUE:
+            raise InvalidParameters("Invalid graduation fee")
+
+        constant_c = 5 * (3 * target_market_cap - 5 * graduation_fee)
+        if constant_c <= 0:
+            raise InvalidParameters(
+                "Invalid relation between market cap and graduation fee"
+            )
+
+        constant_a = 16 * total_supply * target_market_cap
+        constant_b = (target_market_cap + 5 * graduation_fee) * (
+            target_market_cap + 5 * graduation_fee
+        )
+        return Amount(constant_a), Amount(constant_b), Amount(constant_c)
 
     def _get_token_data(self, token_uid: TokenUid) -> TokenData:
         """Get the token data, raising error if not found."""
@@ -302,6 +351,15 @@ class KhensuManager(Blueprint):
         """Validate that the caller is the platform admin."""
         if ctx.get_caller_address() not in self.admin_set:
             raise Unauthorized("Only admin can call this method")
+
+    def _only_creator(self, ctx: Context) -> None:
+        """Validate that the caller is the original contract creator.
+
+        More restrictive than `_only_admin`: reserved for the highest-risk
+        action (blueprint upgrade), which no delegated admin may perform.
+        """
+        if ctx.get_caller_address() != self.admin_address:
+            raise Unauthorized("Only the contract creator can call this method")
 
     def _validate_not_migrated(self, token_uid: TokenUid) -> None:
         """Validate that a token has not been migrated."""
@@ -754,6 +812,10 @@ class KhensuManager(Blueprint):
             HATHOR_TOKEN_UID, token_uid, self.default_pool_fee_rate
         )
 
+        # Release the reservation now that the canonical pool exists, so other
+        # fee-tier pools for this token can be created permissionlessly.
+        dozer.public().release_pool_reservation(token_uid)
+
         # Store the pool key
         self._update_token_data(token_uid, is_migrated=True, pool_key=pool_key)
 
@@ -784,6 +846,22 @@ class KhensuManager(Blueprint):
         image_link: str,
     ) -> TokenUid:
         """Create a new token with the manager."""
+        # Validate token metadata
+        if not (1 <= len(token_name) <= MAX_NAME_LENGTH):
+            raise InvalidParameters("Token name must be 1-30 characters")
+        if not all(c in NAME_ALLOWED_CHARS for c in token_name):
+            raise InvalidParameters(
+                "Token name may only contain letters, numbers, and spaces"
+            )
+        if not (1 <= len(token_symbol) <= MAX_SYMBOL_LENGTH):
+            raise InvalidParameters("Token symbol must be 1-5 characters")
+        if not all(c in SYMBOL_ALLOWED_CHARS for c in token_symbol):
+            raise InvalidParameters(
+                "Token symbol may only contain uppercase letters and numbers"
+            )
+        if len(description) > MAX_DESCRIPTION_LENGTH:
+            raise InvalidParameters("Description must be at most 500 characters")
+
         initial_token_reserve = self.default_token_total_supply
 
         token_uid = self.syscall.create_fee_token(
@@ -793,6 +871,11 @@ class KhensuManager(Blueprint):
             mint_authority=False,
             melt_authority=False,
         )
+
+        # Reserve the token's Dozer pool so nobody can front-run graduation by
+        # pre-creating the pool (which would make migrate_liquidity revert).
+        dozer = self.syscall.get_contract(self.dozer_pool_manager_id, blueprint_id=None)
+        dozer.public().reserve_pool_creation(token_uid)
 
         # Validate the deposit needed to create a fee-based token
         action = self._get_action(ctx, NCActionType.DEPOSIT)
@@ -962,6 +1045,10 @@ class KhensuManager(Blueprint):
         # Calculate HTR return
         htr_out = self._calculate_htr_out(token_uid, Amount(action_in.amount))
 
+        # Defensive solvency guard: a token can never pay out more HTR than its own virtual pool holds.
+        if htr_out > self._get_token_data(token_uid).virtual_pool:
+            raise InsufficientAmount("Insufficient pool liquidity")
+
         # Apply sell fee
         fee_amount = self._calculate_fee(htr_out, self.sell_fee_rate)
         net_amount = htr_out - fee_amount
@@ -1072,7 +1159,7 @@ class KhensuManager(Blueprint):
     def change_buy_fee_rate(self, ctx: Context, buy_fee_rate: int) -> None:
         """Change the buy fee rate for all tokens."""
         self._only_admin(ctx)
-        if buy_fee_rate > 1000 or buy_fee_rate < 0:
+        if buy_fee_rate > MAX_FEE_RATE or buy_fee_rate < 0:
             raise InvalidParameters("Invalid buy fee rate")
         self.buy_fee_rate = buy_fee_rate
 
@@ -1080,7 +1167,7 @@ class KhensuManager(Blueprint):
     def change_sell_fee_rate(self, ctx: Context, sell_fee_rate: int) -> None:
         """Change the sell fee rate for all tokens."""
         self._only_admin(ctx)
-        if sell_fee_rate > 1000 or sell_fee_rate < 0:
+        if sell_fee_rate > MAX_FEE_RATE or sell_fee_rate < 0:
             raise InvalidParameters("Invalid sell fee rate")
         self.sell_fee_rate = sell_fee_rate
 
@@ -1088,7 +1175,7 @@ class KhensuManager(Blueprint):
     def change_creator_fee_rate(self, ctx: Context, creator_fee_rate: int) -> None:
         """Change the creator fee rate for all tokens."""
         self._only_admin(ctx)
-        if creator_fee_rate > 1000 or creator_fee_rate < 0:
+        if creator_fee_rate > MAX_FEE_RATE or creator_fee_rate < 0:
             raise InvalidParameters("Invalid creator fee rate")
         self.creator_fee_rate = creator_fee_rate
 
@@ -1096,7 +1183,7 @@ class KhensuManager(Blueprint):
     def change_pool_fee_rate(self, ctx: Context, default_pool_fee_rate: int) -> None:
         """Change the pool fee rate for all tokens."""
         self._only_admin(ctx)
-        if default_pool_fee_rate > 1000 or default_pool_fee_rate < 0:
+        if default_pool_fee_rate > MAX_POOL_FEE_RATE or default_pool_fee_rate < 0:
             raise InvalidParameters("Invalid pool fee rate")
         self.default_pool_fee_rate = default_pool_fee_rate
 
@@ -1110,28 +1197,14 @@ class KhensuManager(Blueprint):
     ) -> None:
         """Change the bonding curve parameter for new tokens."""
         self._only_admin(ctx)
-        if target_market_cap <= 0:
-            raise InvalidParameters("Invalid target market cap")
-        elif default_token_total_supply <= 0:
-            raise InvalidParameters("Invalid token amount")
-        elif default_graduation_fee < FEE_TOKEN_VALUE:
-            raise InvalidParameters("Invalid graduation fee")
-
-        constant_c = 5 * (3 * target_market_cap - 5 * default_graduation_fee)
-
-        if constant_c <= 0:
-            raise InvalidParameters(
-                "Invalid relation between market cap and graduation fee"
-            )
-
-        constant_a = 16 * default_token_total_supply * target_market_cap
-        constant_b = (target_market_cap + 5 * default_graduation_fee) * (
-            target_market_cap + 5 * default_graduation_fee
+        constant_a, constant_b, constant_c = self._compute_curve_constants(
+            target_market_cap,
+            default_token_total_supply,
+            default_graduation_fee,
         )
-
-        self.default_constant_a = Amount(constant_a)
-        self.default_constant_b = Amount(constant_b)
-        self.default_constant_c = Amount(constant_c)
+        self.default_constant_a = constant_a
+        self.default_constant_b = constant_b
+        self.default_constant_c = constant_c
         self.default_target_market_cap = target_market_cap
         self.default_token_total_supply = default_token_total_supply
         self.default_graduation_fee = default_graduation_fee
@@ -1167,10 +1240,13 @@ class KhensuManager(Blueprint):
 
     @view
     def search(self, keyword: str, number: int, offset: int) -> str:
-        """Search for a tokens with Symbol or Name matching the keyword."""
+        """Search for a tokens with Symbol or Name matching the keyword. Te output has at most 200 tokens and offset at most 1,000,000"""
+        LIMIT = 200
+        OFFSET_LIMIT = 1000000
         keyword = keyword.upper().strip()
         number = max(number, 0)
         offset = max(offset, 0)
+        offset = min(offset, OFFSET_LIMIT)
 
         symbol_list = []
         name_list = []
@@ -1182,20 +1258,21 @@ class KhensuManager(Blueprint):
 
         results = []
         len_symbols = len(symbol_list)
+        symbol_set = set()
 
         if offset < len_symbols:
-            count_from_symbols = min(number, len_symbols - offset)
+            count_from_symbols = min(number, len_symbols - offset, LIMIT)
             for i in range(offset, offset + count_from_symbols):
                 results.append(symbol_list[i].hex())
+                symbol_set.add(symbol_list[i])
 
-        if len(results) < number:
-            remaining_needed = number - len(results)
+        if len(results) < min(number, LIMIT):
+            remaining_needed = min(number, LIMIT) - len(results)
 
             names_to_skip = max(0, offset - len_symbols)
 
-            symbol_set = set(symbol_list)
-
-            for item in name_list:
+            for i in range(0, min(len(name_list), offset + remaining_needed)):
+                item = name_list[i]
                 if item in symbol_set:
                     continue
 
@@ -1310,21 +1387,37 @@ class KhensuManager(Blueprint):
         return " ".join(newest_tokens)
 
     @view
-    def get_user_balance(self, user_address: CallerId) -> str:
-        """Get all token balances of a user."""
-        if user_address not in self.user_balances:
+    def get_user_balance(self, user_address: CallerId, number: int, offset: int) -> str:
+        """Get N token balances of a user after a given offset. N <= 200."""
+        LIMIT = 200
+        number = max(number, 1)
+        offset = max(offset, 0)
+        if user_address not in self.user_balances and offset == 0:
             return HATHOR_TOKEN_UID.hex() + "_" + "0"
 
         user_balance = []
-        if HATHOR_TOKEN_UID in self.user_balances[user_address]:
-            balance = 0
+        balance = 0
+        if offset == 0:
             if HATHOR_TOKEN_UID in self.user_balances[user_address]:
+                offset = 1
                 balance = self.user_balances[user_address][HATHOR_TOKEN_UID]
             user_balance.append(HATHOR_TOKEN_UID.hex() + "_" + str(balance))
 
-        for token_uid in self.user_balance_tokens[user_address]:
+        n = len(self.user_balance_tokens[user_address])
+        last_index = offset
+        for i in range(
+            offset,
+            min(offset + (number - len(user_balance)), n, LIMIT - len(user_balance)),
+        ):
+            token_uid = self.user_balance_tokens[user_address][i]
             if token_uid == HATHOR_TOKEN_UID:
                 continue
+            balance = self.user_balances[user_address][token_uid]
+            user_balance.append(token_uid.hex() + "_" + str(balance))
+            last_index = i + 1
+
+        if len(user_balance) < number and len(user_balance) < LIMIT and last_index < n:
+            token_uid = self.user_balance_tokens[user_address][last_index]
             balance = self.user_balances[user_address][token_uid]
             user_balance.append(token_uid.hex() + "_" + str(balance))
 
@@ -1585,11 +1678,11 @@ class KhensuManager(Blueprint):
             new_version: Version string for the new blueprint (e.g., "1.1.0")
 
         Raises:
-            Unauthorized: If caller is not the owner
+            Unauthorized: If caller is not the contract creator
             InvalidVersion: If new version is not higher than current version
         """
-        # Only owner can upgrade
-        self._only_admin(ctx)
+        # Only the original contract creator can upgrade the blueprint.
+        self._only_creator(ctx)
 
         # Validate version is newer
         if not self._is_version_higher(new_version, self.contract_version):
