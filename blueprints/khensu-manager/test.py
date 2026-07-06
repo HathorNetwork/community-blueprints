@@ -28,7 +28,7 @@ INITIAL_TOKEN_RESERVE = Amount(1000000000_00)  # 1 billion tokens created
 BUY_FEE_RATE = Amount(100)  # 1%
 SELL_FEE_RATE = Amount(300)  # 3%
 CREATOR_FEE_RATE = Amount(100)  # 1%
-POOL_FEE_RATE = Amount(10)  # 0,1%
+POOL_FEE_RATE = Amount(10)
 DEFAULT_GRADUATION_FEE = Amount(100000_00)  # 100,000 HTR (around $1,000)
 LRU_CACHE_CAPACITY = 150  # Default LRU cache capacity
 
@@ -157,7 +157,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
 
         self.runner.call_public_method(
             self.dozer_pool_manager_id,
-            "add_authorized_contract_signer",
+            "add_authorized_signer",
             ctx,
             self.manager_id,
         )
@@ -783,7 +783,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
 
         self.runner.call_public_method(
             self.dozer_pool_manager_id,
-            "remove_authorized_contract_signer",
+            "remove_authorized_signer",
             ctx,
             self.manager_id,
         )
@@ -808,7 +808,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
 
         self.runner.call_public_method(
             self.dozer_pool_manager_id,
-            "add_authorized_contract_signer",
+            "add_authorized_signer",
             ctx,
             self.manager_id,
         )
@@ -939,6 +939,123 @@ class KhensuManagerTestCase(BlueprintTestCase):
         admin_info = self.runner.call_view_method(self.manager_id, "get_platform_info")
         self.assertEqual(admin_info.collected_buy_fees, 0)
 
+    def test_withdraw_fees_all_buckets(self) -> None:
+        """Drain buy, sell, and operation (graduation) fees in one withdrawal."""
+        self._initialize_manager()
+
+        # token1 -> graduate: populates operation (graduation) fees + buy fees
+        token1 = self._register_token("token1", "TK1")
+        self._reach_migration_threshold(token1)
+
+        # token2 -> buy then sell back: populates sell fees (and more buy fees)
+        token2 = self._register_token("token2", "TK2")
+        amount_in = 5_000_000
+        buy_quote = self.runner.call_view_method(
+            self.manager_id, "quote_buy", token2, amount_in
+        )
+        expected_out = int(buy_quote["amount_received"])
+        buy_ctx = self.create_context(
+            caller_id=self.user_address,
+            actions=[
+                NCDepositAction(
+                    token_uid=HTR_UID, amount=int(buy_quote["total_payment"])
+                ),
+                NCWithdrawalAction(token_uid=token2, amount=expected_out),
+            ],
+        )
+        self.runner.call_public_method(self.manager_id, "buy_tokens", buy_ctx, token2)
+
+        sell_amount = expected_out // 2
+        sell_quote = self.runner.call_view_method(
+            self.manager_id, "quote_sell", token2, sell_amount
+        )
+        sell_ctx = self.create_context(
+            caller_id=self.user_address,
+            actions=[
+                NCDepositAction(token_uid=token2, amount=sell_amount),
+                NCWithdrawalAction(
+                    token_uid=HTR_UID, amount=int(sell_quote["amount_received"])
+                ),
+            ],
+        )
+        self.runner.call_public_method(self.manager_id, "sell_tokens", sell_ctx, token2)
+
+        # All three buckets should be populated
+        info = self.runner.call_view_method(self.manager_id, "get_platform_info")
+        self.assertGreater(info.collected_buy_fees, 0)
+        self.assertGreater(info.collected_sell_fees, 0)
+        self.assertGreater(info.collected_operation_fees, 0)
+
+        total = (
+            info.collected_buy_fees
+            + info.collected_sell_fees
+            + info.collected_operation_fees
+        )
+
+        # A single full withdrawal must drain the cascade across all three buckets
+        ctx_admin = self.create_context(
+            caller_id=self.admin_address,
+            actions=[NCWithdrawalAction(token_uid=HTR_UID, amount=total)],
+        )
+        self.runner.call_public_method(self.manager_id, "withdraw_fees", ctx_admin)
+
+        info = self.runner.call_view_method(self.manager_id, "get_platform_info")
+        self.assertEqual(info.collected_buy_fees, 0)
+        self.assertEqual(info.collected_sell_fees, 0)
+        self.assertEqual(info.collected_operation_fees, 0)
+
+    def test_withdraw_fees_errors(self) -> None:
+        """withdraw_fees rejects empty treasury, wrong token, and over-withdrawal."""
+        self._initialize_manager()
+        token1 = self._register_token("token1", "TK1")
+
+        # Empty treasury: no trades yet -> no fees to withdraw
+        with self.assertNCFail("InvalidState", "No fees to withdraw"):
+            ctx = self.create_context(
+                caller_id=self.admin_address,
+                actions=[NCWithdrawalAction(token_uid=HTR_UID, amount=1)],
+            )
+            self.runner.call_public_method(self.manager_id, "withdraw_fees", ctx)
+
+        # Generate fees with a buy
+        amount_in = 500000
+        quote = self.runner.call_view_method(
+            self.manager_id, "quote_buy", token1, amount_in
+        )
+        buy_ctx = self.create_context(
+            caller_id=self.user_address,
+            actions=[
+                NCDepositAction(token_uid=HTR_UID, amount=int(quote["total_payment"])),
+                NCWithdrawalAction(
+                    token_uid=token1, amount=int(quote["amount_received"])
+                ),
+            ],
+        )
+        self.runner.call_public_method(self.manager_id, "buy_tokens", buy_ctx, token1)
+
+        info = self.runner.call_view_method(self.manager_id, "get_platform_info")
+        total = (
+            info.collected_buy_fees
+            + info.collected_sell_fees
+            + info.collected_operation_fees
+        )
+
+        # Wrong token: must be HTR
+        with self.assertNCFail("NCFail", "Can only withdraw HTR"):
+            ctx = self.create_context(
+                caller_id=self.admin_address,
+                actions=[NCWithdrawalAction(token_uid=token1, amount=1)],
+            )
+            self.runner.call_public_method(self.manager_id, "withdraw_fees", ctx)
+
+        # Over-withdrawal beyond collected fees
+        with self.assertNCFail("NCFail", "Invalid withdrawal amount"):
+            ctx = self.create_context(
+                caller_id=self.admin_address,
+                actions=[NCWithdrawalAction(token_uid=HTR_UID, amount=total + 1)],
+            )
+            self.runner.call_public_method(self.manager_id, "withdraw_fees", ctx)
+
     def test_change_parameters(self) -> None:
         """Test changing contract parameters"""
         self._initialize_manager()
@@ -964,7 +1081,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
         )
 
         # Change pool fee rate
-        new_pool_fee = 100  # 1%
+        new_pool_fee = 40
         self.runner.call_public_method(
             self.manager_id, "change_pool_fee_rate", ctx, new_pool_fee
         )
@@ -1115,6 +1232,46 @@ class KhensuManagerTestCase(BlueprintTestCase):
                 self.manager_id, "change_buy_fee_rate", ctx_new_admin, 10
             )
 
+    def test_upgrade_only_creator(self) -> None:
+        """Only the original contract creator may upgrade the blueprint."""
+        self._initialize_manager()
+
+        # Add a delegated admin (not the creator)
+        new_admin = Address(self._get_any_address()[0])
+        ctx_creator = self.create_context(caller_id=self.admin_address)
+        self.runner.call_public_method(
+            self.manager_id, "add_admin", ctx_creator, new_admin
+        )
+
+        # The delegated admin can manage parameters...
+        ctx_new_admin = self.create_context(caller_id=new_admin)
+        self.runner.call_public_method(
+            self.manager_id, "change_buy_fee_rate", ctx_new_admin, 10
+        )
+
+        # ...but must NOT be able to upgrade the blueprint
+        with self.assertNCFail("Unauthorized"):
+            self.runner.call_public_method(
+                self.manager_id,
+                "upgrade_contract",
+                ctx_new_admin,
+                self.blueprint_id_khensu,
+                "2.0.0",
+            )
+
+        # The creator can upgrade
+        self.runner.call_public_method(
+            self.manager_id,
+            "upgrade_contract",
+            ctx_creator,
+            self.blueprint_id_khensu,
+            "2.0.0",
+        )
+        version = self.runner.call_view_method(
+            self.manager_id, "get_contract_version"
+        )
+        self.assertEqual(version, "2.0.0")
+
     def test_multi_token_management(self) -> None:
         """Test managing multiple tokens"""
         self._initialize_manager()
@@ -1130,7 +1287,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
 
         # Verify that token with same symbol cannot be created
         with self.assertNCFail("NCTokenAlreadyExists"):
-            self._register_token("token1_2", "TK1")
+            self._register_token("token12", "TK1")
 
         # Buy tokens for each
         amount_in = 100000
@@ -2332,7 +2489,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
 
         # Initially user has no balance (default HTR with 0)
         balance = self.runner.call_view_method(
-            self.manager_id, "get_user_balance", self.user_address
+            self.manager_id, "get_user_balance", self.user_address, 2, 0
         )
         self.assertEqual(balance, HTR_UID.hex() + "_0")
 
@@ -2363,7 +2520,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
 
         # Check that creator (user_address) received the creator fee in their HTR balance
         balance = self.runner.call_view_method(
-            self.manager_id, "get_user_balance", self.user_address
+            self.manager_id, "get_user_balance", self.user_address, 100, 0
         )
 
         # Parse the balance - should have HTR with creator fee
@@ -2395,7 +2552,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
 
         # Get user balance - should have HTR (from creator fee) and token2 (from slippage)
         balance = self.runner.call_view_method(
-            self.manager_id, "get_user_balance", self.user_address
+            self.manager_id, "get_user_balance", self.user_address, 100, 0
         )
 
         # Parse the balance string
@@ -2445,7 +2602,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
 
         # Check accumulated creator fees
         balance = self.runner.call_view_method(
-            self.manager_id, "get_user_balance", self.user_address
+            self.manager_id, "get_user_balance", self.user_address, 100, 0
         )
 
         balance_parts = balance.split()
@@ -2475,7 +2632,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
 
         # Get user balance - HTR should now have creator fees + sell slippage
         balance = self.runner.call_view_method(
-            self.manager_id, "get_user_balance", self.user_address
+            self.manager_id, "get_user_balance", self.user_address, 100, 0
         )
 
         balance_parts = balance.split()
