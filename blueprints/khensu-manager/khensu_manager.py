@@ -65,6 +65,20 @@ MAX_SYMBOL_LENGTH = 5
 MAX_DESCRIPTION_LENGTH = 500
 NAME_ALLOWED_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
 SYMBOL_ALLOWED_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+MAX_URL_LENGTH = 200
+MAX_IMAGE_LINK_LENGTH = 150
+MIN_IPFS_HASH_LENGTH = 32
+URL_ALLOWED_CHARS = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "-._~:/?#[]@!$&'()*+,;=%"
+)
+IPFS_HASH_ALLOWED_CHARS = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
+TWITTER_URL_PREFIXES = ("https://x.com/", "https://twitter.com/")
+TELEGRAM_URL_PREFIXES = ("https://t.me/", "https://telegram.me/")
+WEBSITE_URL_PREFIXES = ("https://",)
+IPFS_IMAGE_PREFIX = "ipfs://ipfs/"
 
 
 class PlatformInfo(NamedTuple):
@@ -366,6 +380,43 @@ class KhensuManager(Blueprint):
         token_data = self._get_token_data(token_uid)
         if token_data.is_migrated:
             raise InvalidState("Token has already migrated")
+
+    def _validate_optional_url(
+        self, url: str, allowed_prefixes: tuple[str, ...], field_name: str
+    ) -> None:
+        """Validate an optional metadata URL. Empty strings are allowed."""
+        if not url:
+            return
+        if len(url) > MAX_URL_LENGTH:
+            raise InvalidParameters(
+                f"{field_name} URL must be at most {MAX_URL_LENGTH} characters"
+            )
+        if not all(c in URL_ALLOWED_CHARS for c in url):
+            raise InvalidParameters(f"{field_name} URL contains invalid characters")
+        if not any(
+            url.startswith(prefix) and len(url) > len(prefix)
+            for prefix in allowed_prefixes
+        ):
+            raise InvalidParameters(
+                f"{field_name} URL must start with one of: "
+                + ", ".join(allowed_prefixes)
+            )
+
+    def _validate_image_link(self, image_link: str) -> None:
+        """Validate a required image link in the ipfs://ipfs/<hash> format."""
+        if not image_link:
+            raise InvalidParameters("Image link is required")
+        if len(image_link) > MAX_IMAGE_LINK_LENGTH:
+            raise InvalidParameters(
+                f"Image link must be at most {MAX_IMAGE_LINK_LENGTH} characters"
+            )
+        if not image_link.startswith(IPFS_IMAGE_PREFIX):
+            raise InvalidParameters("Image link must be an ipfs://ipfs/<hash> URL")
+        ipfs_hash = image_link[len(IPFS_IMAGE_PREFIX) :]
+        if len(ipfs_hash) < MIN_IPFS_HASH_LENGTH:
+            raise InvalidParameters("Image link IPFS hash is too short")
+        if not all(c in IPFS_HASH_ALLOWED_CHARS for c in ipfs_hash):
+            raise InvalidParameters("Image link IPFS hash contains invalid characters")
 
     def _calculate_fee(self, amount: Amount, fee_rate: int) -> Amount:
         """Calculate fee using ceiling division."""
@@ -861,6 +912,10 @@ class KhensuManager(Blueprint):
             )
         if len(description) > MAX_DESCRIPTION_LENGTH:
             raise InvalidParameters("Description must be at most 500 characters")
+        self._validate_optional_url(twitter, TWITTER_URL_PREFIXES, "Twitter")
+        self._validate_optional_url(telegram, TELEGRAM_URL_PREFIXES, "Telegram")
+        self._validate_optional_url(website, WEBSITE_URL_PREFIXES, "Website")
+        self._validate_image_link(image_link)
 
         initial_token_reserve = self.default_token_total_supply
 
@@ -888,17 +943,6 @@ class KhensuManager(Blueprint):
 
         caller_address = ctx.get_caller_address()
         assert caller_address is not None, "Caller address must be set"
-
-        if twitter and not twitter.startswith("https://"):
-            twitter = ""
-        if telegram and not telegram.startswith("https://"):
-            telegram = ""
-        if website and not website.startswith("https://"):
-            website = ""
-
-        # Store image hash if provided
-        if not image_link or len(image_link) < 32:
-            image_link = ""
 
         self.tokens[token_uid] = TokenData(
             creator=caller_address,
