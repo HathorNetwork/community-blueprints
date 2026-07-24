@@ -320,6 +320,7 @@ class DozerPoolManager(Blueprint):
     # Signed pools for dApp listing
     signed_pools: list[str]  # List of all signed pools
     pool_signers: dict[str, CallerId]  # pool_key -> signer_address
+    reserved_pools: dict[TokenUid, CallerId]  # token -> reserved signer
 
     # Price calculation
     htr_token_map: dict[
@@ -353,6 +354,7 @@ class DozerPoolManager(Blueprint):
         self.token_to_pools: dict[TokenUid, list[str]] = {}
         self.signed_pools: list[str] = []
         self.pool_signers: dict[str, CallerId] = {}
+        self.reserved_pools: dict[TokenUid, CallerId] = {}
         self.htr_token_map: dict[TokenUid, str] = {}
         self.pools: dict[str, PoolState] = {}
 
@@ -1308,6 +1310,11 @@ class DozerPoolManager(Blueprint):
         # Ensure tokens are ordered
         token_a, token_b = self._order_tokens(token_a, token_b)
 
+        for token in (token_a, token_b):
+            reserver = self.reserved_pools.get(token)
+            if reserver is not None and reserver != ctx.caller_id:
+                raise Unauthorized("Pool creation is reserved for this token")
+
         # Create pool key
         pool_key = self._get_pool_key(token_a, token_b, fee)
 
@@ -1745,11 +1752,8 @@ class DozerPoolManager(Blueprint):
         if len(ctx.actions) != 1:
             raise InvalidAction("Must provide exactly one token deposit")
 
-        deposit_action = list(ctx.actions.values())[0][0]
-        if not isinstance(deposit_action, NCDepositAction):
-            raise InvalidAction("Must provide a deposit action")
-
-        token_in = deposit_action.token_uid
+        token_in = list(ctx.actions.keys())[0]
+        deposit_action = self._get_deposit_action(ctx, token_in)
         amount_in = Amount(deposit_action.amount)
         user_address = ctx.caller_id
 
@@ -2326,11 +2330,8 @@ class DozerPoolManager(Blueprint):
         if len(ctx.actions) != 1:
             raise InvalidAction("Must provide exactly one token withdrawal")
 
-        withdrawal_action = list(ctx.actions.values())[0][0]
-        if not isinstance(withdrawal_action, NCWithdrawalAction):
-            raise InvalidAction("Must provide a withdrawal action")
-
-        token_out = withdrawal_action.token_uid
+        token_out = list(ctx.actions.keys())[0]
+        withdrawal_action = self._get_withdrawal_action(ctx, token_out)
         withdrawal_amount = withdrawal_action.amount
 
         # Get pool
@@ -2667,6 +2668,18 @@ class DozerPoolManager(Blueprint):
             action_out.token_uid,
         )
 
+    def _validate_path_pools_signed(self, path: list[str]) -> None:
+        """Validate that all path pools exist, are signed, and are not repeated."""
+        seen: list[str] = []
+        for pool_key in path:
+            if pool_key not in self.all_pools:
+                raise PoolNotFound()
+            if pool_key not in self.pool_signers:
+                raise InvalidPath("Route contains an unsigned pool")
+            if pool_key in seen:
+                raise InvalidPath("Route contains a duplicate pool")
+            seen.append(pool_key)
+
     @public(allow_withdrawal=True, allow_deposit=True)
     def swap_exact_tokens_for_tokens_through_path(
         self, ctx: Context, path_str: str, deadline: Timestamp
@@ -2704,6 +2717,7 @@ class DozerPoolManager(Blueprint):
         # Validate path length
         if len(path) == 0 or len(path) > 3:
             raise InvalidPath("Invalid path length")
+        self._validate_path_pools_signed(path)
 
         # Find deposit and withdrawal actions
         deposit_action, withdrawal_action = self._get_deposit_and_withdrawal_actions(ctx)
@@ -2780,6 +2794,8 @@ class DozerPoolManager(Blueprint):
         # Check if the output amount matches the withdrawal action
         if withdrawal_action.token_uid != token_out:
             raise InvalidAction("Withdrawal token does not match output token")
+        if withdrawal_action.amount > amount_out:
+            raise InvalidAction("Withdrawal amount exceeds swap output")
 
         # Calculate slippage (if the withdrawal amount is less than the calculated output)
         slippage_out = 0
@@ -2964,6 +2980,7 @@ class DozerPoolManager(Blueprint):
         # Validate path length
         if len(path) == 0 or len(path) > 3:
             raise InvalidPath("Invalid path length")
+        self._validate_path_pools_signed(path)
 
         # Find deposit and withdrawal actions
         deposit_action, withdrawal_action = self._get_deposit_and_withdrawal_actions(ctx)
@@ -3085,6 +3102,9 @@ class DozerPoolManager(Blueprint):
                 and intermediate_token != first_pool.token_b
             ):
                 raise InvalidPath("First pool does not contain intermediate token")
+            _, _, first_hop_token_out = self._resolve_token_direction(first_pool, token_in)
+            if first_hop_token_out != intermediate_token:
+                raise InvalidPath("Path discontinuity: first hop output does not match intermediate token")
 
             # Calculate backwards from the output
             # First, calculate how much intermediate token we need
@@ -3205,6 +3225,9 @@ class DozerPoolManager(Blueprint):
                 and first_intermediate_token != first_pool.token_b
             ):
                 raise InvalidPath("First pool does not connect to second pool")
+            _, _, first_hop_token_out = self._resolve_token_direction(first_pool, token_in)
+            if first_hop_token_out != first_intermediate_token:
+                raise InvalidPath("Path discontinuity: first hop output does not match intermediate token")
 
             # Calculate backwards from the output
             # First, calculate how much second_intermediate_token we need
@@ -3518,7 +3541,7 @@ class DozerPoolManager(Blueprint):
         )
 
     @public
-    def add_authorized_signer(self, ctx: Context, signer_address: Address) -> None:
+    def add_authorized_signer(self, ctx: Context, signer_address: CallerId) -> None:
         """Add an address to the list of authorized signers.
 
         Only the contract owner can add authorized signers.
@@ -3541,7 +3564,7 @@ class DozerPoolManager(Blueprint):
                       caller=str(ctx.caller_id))
 
     @public
-    def remove_authorized_signer(self, ctx: Context, signer_address: Address) -> None:
+    def remove_authorized_signer(self, ctx: Context, signer_address: CallerId) -> None:
         """Remove an address from the list of authorized signers.
 
         Only the contract owner can remove authorized signers.
@@ -3566,6 +3589,53 @@ class DozerPoolManager(Blueprint):
         self.log.info('authorized signer removed',
                       signer_address=str(signer_address),
                       caller=str(ctx.caller_id))
+
+    @public
+    def initialize_reserved_pools(self, ctx: Context) -> None:
+        """Initialize reserved pool storage for upgraded contracts.
+
+        Contracts deployed before pool reservations existed do not have the
+        ``reserved_pools`` field in storage. This owner-only migration creates
+        the field without changing any other contract state.
+        """
+        if ctx.caller_id != self.owner:
+            raise Unauthorized("Only the owner can run this migration")
+
+        self.reserved_pools = {}
+
+        self.log.info("reserved_pools initialized", caller=str(ctx.caller_id))
+
+    @public
+    def reserve_pool_creation(self, ctx: Context, token_uid: TokenUid) -> None:
+        """Reserve a token for pool creation."""
+        if ctx.caller_id not in self.authorized_signers:
+            raise Unauthorized("Only authorized signers can reserve pools")
+        if token_uid == HATHOR_TOKEN_UID:
+            raise InvalidTokens("Cannot reserve the native HTR token")
+        existing = self.reserved_pools.get(token_uid)
+        if existing is not None and existing != ctx.caller_id:
+            raise Unauthorized("Token already reserved by another signer")
+        self.reserved_pools[token_uid] = ctx.caller_id
+        self.log.info(
+            "pool creation reserved",
+            token_uid=token_uid.hex(),
+            reserver=str(ctx.caller_id),
+        )
+
+    @public
+    def release_pool_reservation(self, ctx: Context, token_uid: TokenUid) -> None:
+        """Release a token reservation for pool creation."""
+        reserver = self.reserved_pools.get(token_uid)
+        if reserver is None:
+            return
+        if ctx.caller_id != reserver and ctx.caller_id != self.owner:
+            raise Unauthorized("Only the reserver or owner can release")
+        del self.reserved_pools[token_uid]
+        self.log.info(
+            "pool creation reservation released",
+            token_uid=token_uid.hex(),
+            caller=str(ctx.caller_id),
+        )
 
     @public
     def sign_pool(
@@ -3727,6 +3797,24 @@ class DozerPoolManager(Blueprint):
         self.log.info('contract unpaused',
                       caller=str(ctx.caller_id))
 
+    @public(allow_deposit=True)
+    def replenish_funds(self, ctx: Context) -> None:
+        """Allow the owner to replenish contract funds with one token deposit."""
+        if ctx.caller_id != self.owner:
+            raise Unauthorized("Only the owner can replenish funds")
+        if len(ctx.actions) != 1:
+            raise InvalidAction("Must provide exactly one token deposit")
+
+        token = list(ctx.actions.keys())[0]
+        deposit_action = self._get_deposit_action(ctx, token)
+
+        self.log.info(
+            "funds replenished",
+            caller=str(ctx.caller_id),
+            token=deposit_action.token_uid.hex(),
+            amount=deposit_action.amount,
+        )
+
     @view
     def is_paused(self) -> bool:
         """Check if the contract is currently paused.
@@ -3751,7 +3839,7 @@ class DozerPoolManager(Blueprint):
         return result
 
     @view
-    def is_authorized_signer(self, address: Address) -> bool:
+    def is_authorized_signer(self, address: CallerId) -> bool:
         """Check if an address is an authorized signer.
 
         Args:
@@ -4629,7 +4717,13 @@ class DozerPoolManager(Blueprint):
 
             for token in unvisited:
                 amount, hops = distances[token]
-                if amount > max_amount:
+                # Deterministic selection: primary key is output amount, secondary
+                # key is the token bytes. A total order makes the result independent
+                # of `unvisited` set iteration order, which is required for consensus
+                # (ties would otherwise be broken by non-deterministic hash order).
+                if amount > max_amount or (
+                    amount == max_amount and current is not None and token < current
+                ):
                     max_amount = amount
                     current = token
 
@@ -5029,7 +5123,14 @@ class DozerPoolManager(Blueprint):
 
             for token in unvisited:
                 amount, _ = distances[token]
-                if token in unvisited and amount < min_amount:
+                # Deterministic selection: primary key is required input amount,
+                # secondary key is the token bytes. A total order makes the result
+                # independent of `unvisited` set iteration order, which is required
+                # for consensus (ties would otherwise be broken by non-deterministic
+                # hash order).
+                if amount < min_amount or (
+                    amount == min_amount and current is not None and token < current
+                ):
                     min_amount = amount
                     current = token
 

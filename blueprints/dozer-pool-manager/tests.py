@@ -6,10 +6,13 @@ from hathor.crypto.util import decode_address
 from hathor.nanocontracts.blueprints.dozer_pool_manager import (
     DozerPoolManager,
     InvalidAction,
+    InvalidPath,
     InvalidTokens,
     PoolExists,
     Unauthorized,
 )
+from hathor.nanocontracts.exception import NCFail
+from hathorlib.nanocontracts.exception import NCInvalidAction
 
 from hathor.nanocontracts.types import Address, NCDepositAction, NCWithdrawalAction, TokenUid, Amount
 from hathor.transaction.base_transaction import BaseTransaction
@@ -156,6 +159,16 @@ class DozerPoolManagerBlueprintTestCase(BlueprintTestCase):
             self.nc_id, "create_pool", context, fee
         )
         return pool_key, context.caller_id
+
+    def _sign_pool(self, token_a, token_b, fee=3):
+        """Sign a pool as the contract owner (an authorized signer)."""
+        tx = self._get_any_tx()
+        owner_context = self.create_context(
+            [], tx, Address(self.owner_address), timestamp=self.get_current_timestamp()
+        )
+        self.runner.call_public_method(
+            self.nc_id, "sign_pool", owner_context, token_a, token_b, fee
+        )
 
     def _add_liquidity(self, token_a, token_b, fee, amount_a, amount_b=None):
         """Add liquidity to an existing pool"""
@@ -1370,23 +1383,23 @@ class DozerPoolManagerBlueprintTestCase(BlueprintTestCase):
 
         # Add signer
         self.runner.call_public_method(
-            self.nc_id, "add_authorized_signer", owner_context, signer_address
+            self.nc_id, "add_authorized_signer", owner_context, Address(signer_address)
         )
 
         # Verify signer was added
         is_authorized = self.runner.call_view_method(
-            self.nc_id, "is_authorized_signer", signer_address
+            self.nc_id, "is_authorized_signer", Address(signer_address)
         )
         self.assertTrue(is_authorized)
 
         # Remove signer
         self.runner.call_public_method(
-            self.nc_id, "remove_authorized_signer", owner_context, signer_address
+            self.nc_id, "remove_authorized_signer", owner_context, Address(signer_address)
         )
 
         # Verify signer was removed
         is_authorized = self.runner.call_view_method(
-            self.nc_id, "is_authorized_signer", signer_address
+            self.nc_id, "is_authorized_signer", Address(signer_address)
         )
         self.assertFalse(is_authorized)
 
@@ -2534,3 +2547,531 @@ class DozerPoolManagerBlueprintTestCase(BlueprintTestCase):
 
         # The test passes if we reach here without assertion errors
         self._check_balance()
+
+    def test_swap_exact_through_path_inflated_withdrawal_rejected_1hop(self):
+        """Withdrawal > computed output must raise InvalidAction — 1-hop path.
+        """
+        pool_key, _ = self._create_pool(self.token_a, self.token_b, fee=3)
+        self._sign_pool(self.token_a, self.token_b, 3)
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+
+        # Deposit 1_00 base units (1.00 display). Legitimate output is ~99 base
+        # units at 1:1 reserves with fee=3/1000. Request 50_000 — far above the
+        # computed output but within the pool balance so the network layer passes.
+        context = self._prepare_swap_context(self.token_a, 1_00, self.token_b, 50_000)
+
+        with self.assertRaises(InvalidAction):
+            self.runner.call_public_method(
+                self.nc_id,
+                "swap_exact_tokens_for_tokens_through_path",
+                context,
+                pool_key,
+                deadline,
+            )
+
+        # Pool state must remain intact — no HTR should have been drained.
+        self._check_balance()
+
+    def test_swap_exact_through_path_inflated_withdrawal_rejected_2hop(self):
+        """Withdrawal > computed output must raise InvalidAction — 2-hop path.
+        """
+        pool_key_ab, _ = self._create_pool(self.token_a, self.token_b, fee=3)
+        pool_key_bc, _ = self._create_pool(self.token_b, self.token_c, fee=3)
+        self._sign_pool(self.token_a, self.token_b, 3)
+        self._sign_pool(self.token_b, self.token_c, 3)
+        path = f"{pool_key_ab},{pool_key_bc}"
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+
+        context = self._prepare_swap_context(self.token_a, 1_00, self.token_c, 50_000)
+
+        with self.assertRaises(InvalidAction):
+            self.runner.call_public_method(
+                self.nc_id,
+                "swap_exact_tokens_for_tokens_through_path",
+                context,
+                path,
+                deadline,
+            )
+
+        self._check_balance()
+
+    def test_swap_exact_through_path_inflated_withdrawal_rejected_3hop(self):
+        """Withdrawal > computed output must raise InvalidAction — 3-hop path.
+        """
+        pool_key_ab, _ = self._create_pool(self.token_a, self.token_b, fee=3)
+        pool_key_bc, _ = self._create_pool(self.token_b, self.token_c, fee=3)
+        pool_key_cd, _ = self._create_pool(self.token_c, self.token_d, fee=3)
+        self._sign_pool(self.token_a, self.token_b, 3)
+        self._sign_pool(self.token_b, self.token_c, 3)
+        self._sign_pool(self.token_c, self.token_d, 3)
+        path = f"{pool_key_ab},{pool_key_bc},{pool_key_cd}"
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+
+        context = self._prepare_swap_context(self.token_a, 1_00, self.token_d, 50_000)
+
+        with self.assertRaises(InvalidAction):
+            self.runner.call_public_method(
+                self.nc_id,
+                "swap_exact_tokens_for_tokens_through_path",
+                context,
+                path,
+                deadline,
+            )
+
+        self._check_balance()
+
+    # ------------------------------------------------------------------ #
+    # exact-output route: signed-pool + token-continuity regression        #
+    # ------------------------------------------------------------------ #
+
+    def test_through_path_rejects_unsigned_pool_in_route(self):
+        """Exact-output route through an UNSIGNED pool must raise InvalidPath.
+
+        Reproduces the Immunefi exploit setup: a real HTR/TARGET pool plus an
+        attacker-created TARGET/DECOY pool. Routing the malformed 2-hop path
+        ``aux,official`` previously let the attacker withdraw HTR while only the
+        decoy token moved in the first hop. Unsigned pools must not be routable.
+        """
+        htr = TokenUid(HTR_UID)
+        target = self.token_a
+        decoy = self.token_b
+
+        # Real, signed HTR/TARGET pool holding withdrawable HTR.
+        official_pool, _ = self._create_pool(
+            htr, target, fee=3, reserve_a=100_000_000, reserve_b=100_000_000
+        )
+        self._sign_pool(htr, target, 3)
+
+        # Attacker-created, UNSIGNED aux pool (TARGET/DECOY).
+        aux_pool, _ = self._create_pool(
+            target, decoy, fee=3, reserve_a=1_000_000, reserve_b=1_000_000_000
+        )
+
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+        context = self._prepare_swap_context(target, 2, htr, 50_000_000)
+        path = f"{aux_pool},{official_pool}"
+
+        with self.assertRaises(InvalidPath):
+            self.runner.call_public_method(
+                self.nc_id,
+                "swap_tokens_for_exact_tokens_through_path",
+                context,
+                path,
+                deadline,
+            )
+
+        # No HTR drained — internal accounting stays consistent.
+        self._check_balance()
+
+    def test_swap_exact_out_path_rejects_token_discontinuity(self):
+        """Discontinuous exact-output route must raise InvalidPath even if every pool is signed.
+
+        Proves the token-continuity check independently of signed-pool enforcement:
+        the first hop (TARGET->DECOY) does not output the intermediate token TARGET
+        that the second hop (HTR/TARGET) consumes, so the route must be rejected.
+        """
+        htr = TokenUid(HTR_UID)
+        target = self.token_a
+        decoy = self.token_b
+
+        official_pool, _ = self._create_pool(
+            htr, target, fee=3, reserve_a=100_000_000, reserve_b=100_000_000
+        )
+        aux_pool, _ = self._create_pool(
+            target, decoy, fee=3, reserve_a=1_000_000, reserve_b=1_000_000_000
+        )
+        # Sign BOTH pools so signed-pool enforcement passes and the continuity
+        # check is what rejects the malformed path.
+        self._sign_pool(htr, target, 3)
+        self._sign_pool(target, decoy, 3)
+
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+        context = self._prepare_swap_context(target, 2, htr, 50_000_000)
+        path = f"{aux_pool},{official_pool}"
+
+        with self.assertRaises(InvalidPath):
+            self.runner.call_public_method(
+                self.nc_id,
+                "swap_tokens_for_exact_tokens_through_path",
+                context,
+                path,
+                deadline,
+            )
+
+        self._check_balance()
+
+    def test_signed_two_hop_exact_output_swap_succeeds(self):
+        """A legitimate, well-formed, fully-signed 2-hop exact-output swap still works."""
+        pool_ab, _ = self._create_pool(
+            self.token_a, self.token_b, fee=3, reserve_a=10000_00, reserve_b=10000_00
+        )
+        pool_bc, _ = self._create_pool(
+            self.token_b, self.token_c, fee=3, reserve_a=10000_00, reserve_b=10000_00
+        )
+        self._sign_pool(self.token_a, self.token_b, 3)
+        self._sign_pool(self.token_b, self.token_c, 3)
+
+        amount_out = 100_00
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+        # Over-deposit token_a; the method computes the needed input and stores change.
+        context = self._prepare_swap_context(self.token_a, 500_00, self.token_c, amount_out)
+        path = f"{pool_ab},{pool_bc}"
+
+        result = self.runner.call_public_method(
+            self.nc_id,
+            "swap_tokens_for_exact_tokens_through_path",
+            context,
+            path,
+            deadline,
+        )
+
+        self.assertEqual(result.token_in, self.token_a)
+        self.assertEqual(result.token_out, self.token_c)
+        self.assertEqual(result.amount_out, amount_out)
+        self._check_balance()
+
+    def test_find_best_swap_path_tie_break_is_deterministic(self):
+        """Dijkstra routing must break ties deterministically, not by set order.
+
+        Regression for the consensus bug where ``_dijkstra_shortest_path`` selected
+        the frontier node by iterating an ``unvisited`` set. When two routes yield an
+        identical output the winner depended on non-deterministic set iteration order
+        (hash-seed dependent), so different nodes could commit different paths.
+
+        Here two intermediates B and C give a perfectly symmetric pair of routes:
+        A->B->D and A->C->D use pools with identical reserves and fees, so both
+        produce the exact same output. The fix imposes a total order — ties are broken
+        by the smallest TokenUid — so the chosen route must always pass through
+        ``min(token_b, token_c)``, independent of iteration order.
+        """
+        # Symmetric pools: every leg has identical reserves and fee, so A->B == A->C
+        # and B->D == C->D down to the base unit.
+        reserve = 10000_00
+        pool_ab, _ = self._create_pool(
+            self.token_a, self.token_b, fee=3, reserve_a=reserve, reserve_b=reserve
+        )
+        pool_ac, _ = self._create_pool(
+            self.token_a, self.token_c, fee=3, reserve_a=reserve, reserve_b=reserve
+        )
+        pool_bd, _ = self._create_pool(
+            self.token_b, self.token_d, fee=3, reserve_a=reserve, reserve_b=reserve
+        )
+        pool_cd, _ = self._create_pool(
+            self.token_c, self.token_d, fee=3, reserve_a=reserve, reserve_b=reserve
+        )
+        # Only signed pools are routable.
+        self._sign_pool(self.token_a, self.token_b, 3)
+        self._sign_pool(self.token_a, self.token_c, 3)
+        self._sign_pool(self.token_b, self.token_d, 3)
+        self._sign_pool(self.token_c, self.token_d, 3)
+
+        # The deterministic tie-break selects the smaller-bytes intermediate token.
+        if self.token_b < self.token_c:
+            expected_path = f"{pool_ab},{pool_bd}"
+        else:
+            expected_path = f"{pool_ac},{pool_cd}"
+
+        result = self.runner.call_view_method(
+            self.nc_id,
+            "find_best_swap_path",
+            100_00,
+            self.token_a,
+            self.token_d,
+            3,
+        )
+
+        # Sanity: a 2-hop route through one of the symmetric intermediates was found.
+        self.assertGreater(result.amount_out, 0)
+        self.assertIn(
+            result.path,
+            {f"{pool_ab},{pool_bd}", f"{pool_ac},{pool_cd}"},
+        )
+        # The tie must resolve to the smaller-token route, deterministically.
+        self.assertEqual(result.path, expected_path)
+
+    def test_swap_exact_out_3hop_inner_boundary_needs_no_second_check(self):
+        """3-hop exact-output: a discontinuity at the hop2->hop3 boundary is
+        unconstructible, so no second continuity check is needed.
+
+        The chain is  token_in -[pool0]-> first_int -[pool1]-> second_int -[pool2]-> token_out.
+        ``second_int`` is derived as ``_get_other_token(pool2, token_out)`` and
+        ``first_int`` as ``_get_other_token(pool1, second_int)``. Because a pool has two
+        DISTINCT tokens and ``_get_other_token`` is an involution, the second hop is
+        FORCED to output ``second_int`` (= the last hop's input) the moment ``first_int``
+        is derived. The only way to break hop2->hop3 continuity is to route the middle
+        hop through a pool that does not contain ``second_int`` at all — and that is
+        rejected by ``_get_other_token`` raising InvalidTokens while deriving ``first_int``,
+        BEFORE any swap runs. Hence an explicit second guardrail would be dead code.
+
+        Here the middle pool (DECOY/JUNK) deliberately does not contain TARGET (the
+        token the victim HTR/TARGET pool needs), so the malformed route is rejected.
+        """
+        htr = TokenUid(HTR_UID)
+        target = self.token_a   # paired with HTR in the victim pool
+        decoy = self.token_b
+        junk = self.token_c
+        dep = self.token_d      # deposited token (first hop input)
+
+        # pool2 (last): signed victim HTR/TARGET pool holding withdrawable HTR.
+        victim_pool, _ = self._create_pool(
+            htr, target, fee=3, reserve_a=100_000_000, reserve_b=100_000_000
+        )
+        # pool1 (middle): signed, but does NOT contain TARGET -> breaks hop2->hop3.
+        middle_pool, _ = self._create_pool(
+            decoy, junk, fee=3, reserve_a=1_000_000, reserve_b=1_000_000_000
+        )
+        # pool0 (first): signed, carries the deposited token.
+        first_pool, _ = self._create_pool(
+            dep, self.token_e, fee=3, reserve_a=1_000_000, reserve_b=1_000_000
+        )
+        self._sign_pool(htr, target, 3)
+        self._sign_pool(decoy, junk, 3)
+        self._sign_pool(dep, self.token_e, 3)
+
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+        context = self._prepare_swap_context(dep, 1_000, htr, 50_000_000)
+        path = f"{first_pool},{middle_pool},{victim_pool}"
+
+        contract_before = self.get_readonly_contract(self.nc_id)
+        assert isinstance(contract_before, DozerPoolManager)
+        htr_reserve_before = contract_before.pools[victim_pool].reserve_a
+
+        # Rejected while deriving the first intermediate token (TARGET not in the
+        # middle pool) — proving the inner boundary is protected without a 2nd check.
+        with self.assertRaises(InvalidTokens):
+            self.runner.call_public_method(
+                self.nc_id,
+                "swap_tokens_for_exact_tokens_through_path",
+                context,
+                path,
+                deadline,
+            )
+
+        contract_after = self.get_readonly_contract(self.nc_id)
+        assert isinstance(contract_after, DozerPoolManager)
+        # No HTR drained; state rolled back.
+        self.assertEqual(contract_after.pools[victim_pool].reserve_a, htr_reserve_before)
+        self._check_balance()
+
+    def test_swap_exact_out_3hop_well_formed_route_succeeds(self):
+        """Positive anchor: a continuous, fully-signed 3-hop exact-output route works.
+
+        Confirms the negative test above rejects a *malformed* route, not 3-hop routing
+        in general — so removing the redundant second check does not break valid paths.
+        """
+        pool_ab, _ = self._create_pool(
+            self.token_a, self.token_b, fee=3, reserve_a=10000_00, reserve_b=10000_00
+        )
+        pool_bc, _ = self._create_pool(
+            self.token_b, self.token_c, fee=3, reserve_a=10000_00, reserve_b=10000_00
+        )
+        pool_cd, _ = self._create_pool(
+            self.token_c, self.token_d, fee=3, reserve_a=10000_00, reserve_b=10000_00
+        )
+        self._sign_pool(self.token_a, self.token_b, 3)
+        self._sign_pool(self.token_b, self.token_c, 3)
+        self._sign_pool(self.token_c, self.token_d, 3)
+
+        amount_out = 100_00
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+        # Over-deposit token_a; the method computes the needed input and stores change.
+        context = self._prepare_swap_context(self.token_a, 1000_00, self.token_d, amount_out)
+        path = f"{pool_ab},{pool_bc},{pool_cd}"
+
+        result = self.runner.call_public_method(
+            self.nc_id,
+            "swap_tokens_for_exact_tokens_through_path",
+            context,
+            path,
+            deadline,
+        )
+        self.assertEqual(result.token_in, self.token_a)
+        self.assertEqual(result.token_out, self.token_d)
+        self.assertEqual(result.amount_out, amount_out)
+        self._check_balance()
+
+    def test_swap_exact_in_path_rejects_token_discontinuity(self):
+        """Exact-INPUT route is immune to the wrong-intermediate exploit by construction.
+
+        The exact-input method forward-chains: each hop is fed the previous hop's REAL
+        output token (``current_token = next_token``), and ``_get_other_token`` raises if
+        that token is not in the next pool. Reproducing the Immunefi exploit shape on the
+        exact-input method — deposit TARGET, malformed 2-hop path ``aux=TARGET/DECOY`` then
+        ``official=HTR/TARGET``, withdraw HTR — is rejected at the second hop: the first
+        hop genuinely outputs DECOY, which is not a member of the HTR/TARGET pool, so no
+        phantom TARGET can reach the victim pool. Both pools are signed so the rejection
+        comes from continuity, not signed-pool enforcement.
+        """
+        htr = TokenUid(HTR_UID)
+        target = self.token_a
+        decoy = self.token_b
+
+        official_pool, _ = self._create_pool(
+            htr, target, fee=3, reserve_a=100_000_000, reserve_b=100_000_000
+        )
+        aux_pool, _ = self._create_pool(
+            target, decoy, fee=3, reserve_a=1_000_000, reserve_b=1_000_000_000
+        )
+        self._sign_pool(htr, target, 3)
+        self._sign_pool(target, decoy, 3)
+
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+        # Deposit TARGET and attempt to withdraw HTR through the malformed route.
+        context = self._prepare_swap_context(target, 1_000, htr, 1)
+        path = f"{aux_pool},{official_pool}"
+
+        contract_before = self.get_readonly_contract(self.nc_id)
+        assert isinstance(contract_before, DozerPoolManager)
+        htr_reserve_before = contract_before.pools[official_pool].reserve_a
+
+        with self.assertRaises(InvalidTokens):
+            self.runner.call_public_method(
+                self.nc_id,
+                "swap_exact_tokens_for_tokens_through_path",
+                context,
+                path,
+                deadline,
+            )
+
+        contract_after = self.get_readonly_contract(self.nc_id)
+        assert isinstance(contract_after, DozerPoolManager)
+        # HTR untouched; hop-1's mutation on the aux pool was rolled back on NCFail.
+        self.assertEqual(contract_after.pools[official_pool].reserve_a, htr_reserve_before)
+        self._check_balance()
+
+    def test_repeated_pool_route_rejected(self):
+        """Duplicate pools in a route must be rejected with InvalidPath.
+
+        Regression for the reviewer's reused-pool finding: an exact-output route
+        ``[P, P, Q]`` prices every hop off a single reserve snapshot, so the second
+        swap on the doubly-used pool P runs with stale amounts and can leave P off its
+        constant-product curve (K inflates ~25% while ``_check_k_not_decreased`` only
+        forbids K *decreasing*). Funds stay safe, but the state is invalid. The
+        duplicate-pool guard rejects the route before any swap runs, so P is untouched.
+        """
+        a, b, c = self.token_a, self.token_b, self.token_c
+        pool_p, _ = self._create_pool(a, b, fee=0, reserve_a=1_000_000, reserve_b=1_000_000)
+        pool_q, _ = self._create_pool(b, c, fee=0, reserve_a=1_000_000, reserve_b=1_000_000)
+        self._sign_pool(a, b, 0)
+        self._sign_pool(b, c, 0)
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+
+        context = self._prepare_swap_context(b, 10**9, c, 200_000)
+
+        with self.assertRaises(InvalidPath):
+            self.runner.call_public_method(
+                self.nc_id,
+                "swap_tokens_for_exact_tokens_through_path",
+                context,
+                f"{pool_p},{pool_p},{pool_q}",
+                deadline,
+            )
+
+        # Pool P untouched — the route was rejected before any swap, no off-curve state.
+        contract = self.get_readonly_contract(self.nc_id)
+        assert isinstance(contract, DozerPoolManager)
+        self.assertEqual(contract.pools[pool_p].reserve_a, 1_000_000)
+        self.assertEqual(contract.pools[pool_p].reserve_b, 1_000_000)
+        self._check_balance()
+
+    def test_repeated_pool_route_rejected_exact_input(self):
+        """Duplicate pools are rejected on the exact-input router too (same guard)."""
+        a, b, c = self.token_a, self.token_b, self.token_c
+        pool_p, _ = self._create_pool(a, b, fee=0, reserve_a=1_000_000, reserve_b=1_000_000)
+        pool_q, _ = self._create_pool(b, c, fee=0, reserve_a=1_000_000, reserve_b=1_000_000)
+        self._sign_pool(a, b, 0)
+        self._sign_pool(b, c, 0)
+        deadline = self.get_current_timestamp() + 365 * 24 * 60 * 60
+
+        context = self._prepare_swap_context(b, 1_000, c, 1)
+        with self.assertRaises(InvalidPath):
+            self.runner.call_public_method(
+                self.nc_id,
+                "swap_exact_tokens_for_tokens_through_path",
+                context,
+                f"{pool_p},{pool_p},{pool_q}",
+                deadline,
+            )
+        self._check_balance()
+
+    # ------------------------------------------------------------------ #
+    # replenish_funds                                                      #
+    # ------------------------------------------------------------------ #
+
+    def test_replenish_funds_owner_only(self):
+        """Non-owner callers must be rejected with Unauthorized."""
+        tx = self._get_any_tx()
+        actions = [NCDepositAction(token_uid=self.token_a, amount=1_000)]
+        non_owner_context = self.create_context(
+            actions=actions,
+            vertex=tx,
+            caller_id=Address(self._get_any_address()[0]),
+            timestamp=self.get_current_timestamp(),
+        )
+        with self.assertRaises(Unauthorized):
+            self.runner.call_public_method(
+                self.nc_id, "replenish_funds", non_owner_context
+            )
+
+    def test_replenish_funds_accepts_owner_deposit(self):
+        """Owner depositing a single token must succeed without error."""
+        tx = self._get_any_tx()
+        actions = [NCDepositAction(token_uid=self.token_a, amount=5_000)]
+        context = self.create_context(
+            actions=actions,
+            vertex=tx,
+            caller_id=Address(self.owner_address),
+            timestamp=self.get_current_timestamp(),
+        )
+        # Must complete without raising — the network credits the deposit.
+        self.runner.call_public_method(self.nc_id, "replenish_funds", context)
+
+    # ------------------------------------------------------------------ #
+    # double-action exploit regression                                     #
+    # ------------------------------------------------------------------ #
+
+    def test_remove_liquidity_single_token_double_withdrawal_rejected(self):
+        """Two withdrawal actions for the same token must be rejected.
+
+        Regression test for the double-drain exploit. The protocol layer now enforces
+        ``restrict_dup_actions=True``, so a context carrying two actions for the same
+        token is rejected with NCInvalidAction at construction — one layer before the
+        contract method runs. (The contract's own _get_withdrawal_action ->
+        ctx.get_single_action guard remains as defense-in-depth.)
+        """
+        pool_key, (_, add_context) = (
+            self._create_pool(self.token_a, self.token_b, fee=3, reserve_a=100000_00, reserve_b=200000_00),
+            self._add_liquidity(self.token_a, self.token_b, 3, 1000_00),
+        )
+
+        tx = self._get_any_tx()
+        # Two withdrawal actions for the same token are rejected before the method runs.
+        actions = [
+            NCWithdrawalAction(token_uid=self.token_a, amount=500),
+            NCWithdrawalAction(token_uid=self.token_a, amount=500),
+        ]
+        with self.assertRaises(NCInvalidAction):
+            self.create_context(
+                actions=actions,
+                vertex=tx,
+                caller_id=Address(add_context.caller_id),
+                timestamp=self.get_current_timestamp(),
+            )
+
+    def test_add_liquidity_single_token_double_deposit_rejected(self):
+        """Two deposit actions for the same token must be rejected at the protocol layer."""
+        pool_key, _ = self._create_pool(self.token_a, self.token_b, fee=3)
+
+        tx = self._get_any_tx()
+        # Two deposit actions for the same token are rejected before the method runs.
+        actions = [
+            NCDepositAction(token_uid=self.token_a, amount=500),
+            NCDepositAction(token_uid=self.token_a, amount=500),
+        ]
+        with self.assertRaises(NCInvalidAction):
+            self.create_context(
+                actions=actions,
+                vertex=tx,
+                caller_id=Address(self._get_any_address()[0]),
+                timestamp=self.get_current_timestamp(),
+            )
