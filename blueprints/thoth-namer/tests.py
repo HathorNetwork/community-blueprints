@@ -728,6 +728,28 @@ class NCThothNamerBlueprintTestCase(BlueprintTestCase):
             return address_bytes, key
         return address_bytes
 
+    def test_nft_salt_realistic_timestamp_and_same_block(self):
+        """NFTs minted at a real-world timestamp, in the same block and with the same symbol, get distinct UIDs."""
+        self.initialize_contract()
+
+        # Move the clock to a realistic block timestamp
+        realistic_timestamp = 1_700_000_000
+        self.clock.advance(realistic_timestamp - self.get_current_timestamp())
+        self.assertEqual(self.get_current_timestamp(), realistic_timestamp)
+
+        # Two names registered in the same block with the same token symbol
+        fee = self.runner.call_view_method(self.nc_id, 'calculate_fee', "same-block-a")
+        self._register_name("same-block-a", fee, token_symbol="SAME")
+        self._register_name("same-block-b", fee, token_symbol="SAME")
+
+        data_a = self.runner.call_view_method(self.nc_id, 'get_name_data', "same-block-a")
+        data_b = self.runner.call_view_method(self.nc_id, 'get_name_data', "same-block-b")
+        self.assertNotEqual(data_a['token_uid'], data_b['token_uid'])
+        self.assertEqual(
+            self.runner.call_view_method(self.nc_id, 'get_name_expiration_date', "same-block-a"),
+            realistic_timestamp + 365 * 24 * 60 * 60
+        )
+
     # ==================== Profile Data View Tests ====================
 
     def test_get_profile_data_empty(self):
