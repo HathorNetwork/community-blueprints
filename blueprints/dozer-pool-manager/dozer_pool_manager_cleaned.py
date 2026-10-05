@@ -3,6 +3,7 @@ from hathor import Blueprint, BlueprintId, Context, NCFail, Address, Amount, Cal
 PRECISION = Amount(10 ** 20)
 MINIMUM_LIQUIDITY = Amount(10 ** 3)
 MAX_POOLS_TO_ITERATE = 1000
+MAX_PAGE_SIZE = 100
 PRICE_PRECISION = 10 ** 8
 MAX_PRICE_IMPACT = Amount(500)
 PoolKey = str
@@ -449,7 +450,7 @@ class DozerPoolManager(Blueprint):
         return amount_in
     @view
     def front_quote_add_liquidity_in(self, amount_in: Amount, token_in: TokenUid, pool_key: str) -> Amount:
-        if pool_key not in self.all_pools:
+        if pool_key not in self.pools:
             raise PoolNotFound()
         pool = self.pools[pool_key]
         reserve_a = pool.reserve_a
@@ -497,11 +498,11 @@ class DozerPoolManager(Blueprint):
         result = self._compute_remove_liquidity_single_token(liquidity_to_remove=user_liquidity, token_out=token_out, reserve_a=pool.reserve_a, reserve_b=pool.reserve_b, token_a=token_a, token_b=token_b, total_liquidity=pool.total_liquidity, fee_numerator=pool.fee_numerator, fee_denominator=pool.fee_denominator, pool_key=pool_key)
         if result.swap_amount > 0:
             if token_out == token_a:
-                swap_reserve_in = Amount(pool.reserve_b - result.amount_b + result.swap_amount)
+                swap_reserve_in = Amount(pool.reserve_b - result.amount_b)
                 swap_reserve_out = Amount(pool.reserve_a - result.amount_a)
                 price_impact = self._calculate_single_swap_price_impact(result.swap_amount, result.swap_output, swap_reserve_in, swap_reserve_out)
             else:
-                swap_reserve_in = Amount(pool.reserve_a - result.amount_a + result.swap_amount)
+                swap_reserve_in = Amount(pool.reserve_a - result.amount_a)
                 swap_reserve_out = Amount(pool.reserve_b - result.amount_b)
                 price_impact = self._calculate_single_swap_price_impact(result.swap_amount, result.swap_output, swap_reserve_in, swap_reserve_out)
         else:
@@ -523,11 +524,11 @@ class DozerPoolManager(Blueprint):
         result = self._compute_remove_liquidity_single_token(liquidity_to_remove=liquidity_to_remove, token_out=token_out, reserve_a=pool.reserve_a, reserve_b=pool.reserve_b, token_a=token_a, token_b=token_b, total_liquidity=pool.total_liquidity, fee_numerator=pool.fee_numerator, fee_denominator=pool.fee_denominator, pool_key=pool_key)
         if result.swap_amount > 0:
             if token_out == token_a:
-                swap_reserve_in = Amount(pool.reserve_b - result.amount_b + result.swap_amount)
+                swap_reserve_in = Amount(pool.reserve_b - result.amount_b)
                 swap_reserve_out = Amount(pool.reserve_a - result.amount_a)
                 price_impact = self._calculate_single_swap_price_impact(result.swap_amount, result.swap_output, swap_reserve_in, swap_reserve_out)
             else:
-                swap_reserve_in = Amount(pool.reserve_a - result.amount_a + result.swap_amount)
+                swap_reserve_in = Amount(pool.reserve_a - result.amount_a)
                 swap_reserve_out = Amount(pool.reserve_b - result.amount_b)
                 price_impact = self._calculate_single_swap_price_impact(result.swap_amount, result.swap_output, swap_reserve_in, swap_reserve_out)
         else:
@@ -535,7 +536,7 @@ class DozerPoolManager(Blueprint):
         return SingleTokenRemovalQuote(amount_out=result.total_amount_out, token_a_withdrawn=result.amount_a, token_b_withdrawn=result.amount_b, swap_amount=result.swap_amount, swap_output=result.swap_output, price_impact=price_impact, user_liquidity=Amount(user_liquidity), protocol_liquidity_increase=result.protocol_liquidity_increase)
     @view
     def front_quote_add_liquidity_out(self, amount_out: Amount, token_in: TokenUid, pool_key: str) -> Amount:
-        if pool_key not in self.all_pools:
+        if pool_key not in self.pools:
             raise PoolNotFound()
         pool = self.pools[pool_key]
         reserve_a = pool.reserve_a
@@ -841,7 +842,7 @@ class DozerPoolManager(Blueprint):
         current_total_liquidity = Amount(total_liquidity - liquidity_to_remove)
         if token_out == token_a:
             if amount_b > 0:
-                swap_reserve_in = Amount(new_reserve_b + amount_b)
+                swap_reserve_in = new_reserve_b
                 swap_reserve_out = Amount(new_reserve_a)
                 extra_a = self.get_amount_out(amount_b, swap_reserve_in, swap_reserve_out, fee_numerator, fee_denominator)
                 total_amount_out = amount_a + extra_a
@@ -860,7 +861,7 @@ class DozerPoolManager(Blueprint):
         else:
             assert token_out == token_b, f'Token {token_out} is not part of pool'
             if amount_a > 0:
-                swap_reserve_in = Amount(new_reserve_a + amount_a)
+                swap_reserve_in = new_reserve_a
                 swap_reserve_out = Amount(new_reserve_b)
                 extra_b = self.get_amount_out(amount_a, swap_reserve_in, swap_reserve_out, fee_numerator, fee_denominator)
                 total_amount_out = amount_b + extra_b
@@ -938,11 +939,11 @@ class DozerPoolManager(Blueprint):
         k_before_swap = Amount(reserve_a_after_removal * reserve_b_after_removal)
         if result.swap_amount > 0:
             if token_out == token_a:
-                swap_reserve_in = Amount(reserve_b_after_removal + result.swap_amount)
+                swap_reserve_in = reserve_b_after_removal
                 swap_reserve_out = reserve_a_after_removal
                 token_in_for_swap = token_b
             else:
-                swap_reserve_in = Amount(reserve_a_after_removal + result.swap_amount)
+                swap_reserve_in = reserve_a_after_removal
                 swap_reserve_out = reserve_b_after_removal
                 token_in_for_swap = token_a
             price_impact = self._calculate_single_swap_price_impact(result.swap_amount, result.swap_output, swap_reserve_in, swap_reserve_out)
@@ -1022,7 +1023,7 @@ class DozerPoolManager(Blueprint):
     def _validate_path_pools_signed(self, path: list[str]) -> None:
         seen: list[str] = []
         for pool_key in path:
-            if pool_key not in self.all_pools:
+            if pool_key not in self.pools:
                 raise PoolNotFound()
             if pool_key not in self.pool_signers:
                 raise InvalidPath('Route contains an unsigned pool')
@@ -1044,7 +1045,7 @@ class DozerPoolManager(Blueprint):
         amount_in = deposit_action.amount
         token_in = deposit_action.token_uid
         first_pool_key = path[0]
-        if first_pool_key not in self.all_pools:
+        if first_pool_key not in self.pools:
             raise PoolNotFound()
         current_amount = Amount(amount_in)
         current_token = token_in
@@ -1058,7 +1059,7 @@ class DozerPoolManager(Blueprint):
             current_amount = first_amount_out
             current_token = next_token
             second_pool_key = path[1]
-            if second_pool_key not in self.all_pools:
+            if second_pool_key not in self.pools:
                 raise PoolNotFound()
             second_pool = self.pools[second_pool_key]
             next_token = self._get_other_token(second_pool, current_token)
@@ -1070,7 +1071,7 @@ class DozerPoolManager(Blueprint):
                 current_amount = second_amount_out
                 current_token = next_token
                 third_pool_key = path[2]
-                if third_pool_key not in self.all_pools:
+                if third_pool_key not in self.pools:
                     raise PoolNotFound()
                 third_pool = self.pools[third_pool_key]
                 next_token = self._get_other_token(third_pool, current_token)
@@ -1137,7 +1138,7 @@ class DozerPoolManager(Blueprint):
         token_in = deposit_action.token_uid
         if len(path) == 1:
             pool_key = path[0]
-            if pool_key not in self.all_pools:
+            if pool_key not in self.pools:
                 raise PoolNotFound()
             pool = self.pools[pool_key]
             if token_out != pool.token_a and token_out != pool.token_b:
@@ -1158,7 +1159,7 @@ class DozerPoolManager(Blueprint):
             self._swap_exact_out(Amount(amount_in), token_in, Amount(amount_out), pool_key, ctx)
             return SwapResult(Amount(actual_amount_in), change_in, token_in, Amount(amount_out), token_out)
         last_pool_key = path[-1]
-        if last_pool_key not in self.all_pools:
+        if last_pool_key not in self.pools:
             raise PoolNotFound()
         last_pool = self.pools[last_pool_key]
         if token_out != last_pool.token_a and token_out != last_pool.token_b:
@@ -1168,7 +1169,7 @@ class DozerPoolManager(Blueprint):
             second_pool = self.pools[second_pool_key]
             intermediate_token = self._get_other_token(second_pool, token_out)
             first_pool_key = path[0]
-            if first_pool_key not in self.all_pools:
+            if first_pool_key not in self.pools:
                 raise PoolNotFound()
             first_pool = self.pools[first_pool_key]
             if token_in != first_pool.token_a and token_in != first_pool.token_b:
@@ -1202,17 +1203,17 @@ class DozerPoolManager(Blueprint):
             return SwapResult(Amount(actual_amount_in), change_in, token_in, Amount(amount_out), token_out)
         if len(path) == 3:
             third_pool_key = path[2]
-            if third_pool_key not in self.all_pools:
+            if third_pool_key not in self.pools:
                 raise PoolNotFound()
             third_pool = self.pools[third_pool_key]
             second_intermediate_token = self._get_other_token(third_pool, token_out)
             second_pool_key = path[1]
-            if second_pool_key not in self.all_pools:
+            if second_pool_key not in self.pools:
                 raise PoolNotFound()
             second_pool = self.pools[second_pool_key]
             first_intermediate_token = self._get_other_token(second_pool, second_intermediate_token)
             first_pool_key = path[0]
-            if first_pool_key not in self.all_pools:
+            if first_pool_key not in self.pools:
                 raise PoolNotFound()
             first_pool = self.pools[first_pool_key]
             if token_in != first_pool.token_a and token_in != first_pool.token_b:
@@ -1563,6 +1564,8 @@ class DozerPoolManager(Blueprint):
             raise Unauthorized('Only owner can change owner')
         old_owner = self.owner
         self.owner = new_owner
+        self.authorized_signers.discard(old_owner)
+        self.authorized_signers.add(new_owner)
         self.log.info('owner changed', old_owner=str(old_owner), new_owner=str(new_owner), caller=str(ctx.caller_id))
     @public
     def upgrade_contract(self, ctx: Context, new_blueprint_id: BlueprintId, new_version: str) -> None:
@@ -1608,6 +1611,93 @@ class DozerPoolManager(Blueprint):
         result = []
         for pool_key in self.all_pools:
             result.append(pool_key)
+        return result
+    def _page_bounds(self, skip: int, limit: int) -> tuple[int, int]:
+        if skip < 0 or limit <= 0:
+            raise InvalidAction('Invalid page parameters')
+        if limit > MAX_PAGE_SIZE:
+            limit = MAX_PAGE_SIZE
+        total = len(self.all_pools)
+        end = skip + limit
+        if end > total:
+            end = total
+        if skip > end:
+            skip = end
+        return (skip, end)
+    def _page_unique_tokens(self, start: int, end: int) -> set[TokenUid]:
+        unique_tokens = set()
+        for i in range(start, end):
+            pool = self.pools[self.all_pools[i]]
+            unique_tokens.add(pool.token_a)
+            unique_tokens.add(pool.token_b)
+        return unique_tokens
+    @view
+    def get_pool_count(self) -> int:
+        return len(self.all_pools)
+    @view
+    def get_pools_page(self, skip: int, limit: int) -> list[str]:
+        start, end = self._page_bounds(skip, limit)
+        result = []
+        for i in range(start, end):
+            result.append(self.all_pools[i])
+        return result
+    @view
+    def get_signed_pools_page(self, skip: int, limit: int) -> list[str]:
+        start, end = self._page_bounds(skip, limit)
+        result = []
+        for i in range(start, end):
+            pool_key = self.all_pools[i]
+            if pool_key in self.pool_signers:
+                result.append(pool_key)
+        return result
+    @view
+    def get_user_pools_page(self, address: CallerId, skip: int, limit: int) -> list[str]:
+        start, end = self._page_bounds(skip, limit)
+        user_pools = []
+        for i in range(start, end):
+            pool_key = self.all_pools[i]
+            if self.pool_user_liquidity[pool_key].get(address, 0) > 0:
+                user_pools.append(pool_key)
+        return user_pools
+    @view
+    def get_user_positions_page(self, address: CallerId, skip: int, limit: int) -> dict[str, UserPosition]:
+        start, end = self._page_bounds(skip, limit)
+        positions = {}
+        for i in range(start, end):
+            pool_key = self.all_pools[i]
+            if self.pool_user_liquidity[pool_key].get(address, 0) > 0:
+                user_info = self.user_info(address, pool_key)
+                positions[pool_key] = UserPosition(liquidity=user_info.liquidity, token0Amount=user_info.token0Amount, token1Amount=user_info.token1Amount, share=user_info.share, balance_a=user_info.balance_a, balance_b=user_info.balance_b, token_a=user_info.token_a, token_b=user_info.token_b)
+        return positions
+    @view
+    def get_token_prices_in_htr_page(self, skip: int, limit: int) -> dict[str, Amount]:
+        start, end = self._page_bounds(skip, limit)
+        result = {}
+        result[HATHOR_TOKEN_UID.hex()] = Amount(100000000)
+        for token in self._page_unique_tokens(start, end):
+            if token != HATHOR_TOKEN_UID:
+                price = self.get_token_price_in_htr(token)
+                if price > 0:
+                    result[token.hex()] = Amount(price)
+        return result
+    @view
+    def get_token_prices_in_usd_page(self, skip: int, limit: int) -> dict[str, Amount]:
+        start, end = self._page_bounds(skip, limit)
+        if not self.htr_usd_pool_key:
+            return {}
+        result = {}
+        usd_pool = self.pools[self.htr_usd_pool_key]
+        if usd_pool.token_a == HATHOR_TOKEN_UID:
+            usd_token = usd_pool.token_b
+        else:
+            usd_token = usd_pool.token_a
+        for token in self._page_unique_tokens(start, end):
+            if token == usd_token:
+                result[token.hex()] = Amount(100000000)
+            else:
+                price = self.get_token_price_in_usd(token)
+                if price > 0:
+                    result[token.hex()] = Amount(price)
         return result
     @view
     def get_pools_for_token(self, token: TokenUid) -> list[str]:
@@ -1747,10 +1837,6 @@ class DozerPoolManager(Blueprint):
             max_amount = 0
             for token in unvisited:
                 amount, hops = distances[token]
-                # Deterministic selection: primary key is output amount, secondary
-                # key is the token bytes. A total order makes the result independent
-                # of `unvisited` set iteration order, which is required for consensus
-                # (ties would otherwise be broken by non-deterministic hash order).
                 if amount > max_amount or (
                     amount == max_amount and current is not None and token < current
                 ):
@@ -1832,7 +1918,7 @@ class DozerPoolManager(Blueprint):
         current_amount = ref_amount
         current_token = token_in
         for pool_key in pool_keys:
-            if pool_key not in self.all_pools:
+            if pool_key not in self.pools:
                 return Amount(0)
             pool = self.pools[pool_key]
             swap_info = self._try_resolve_token_direction(pool, current_token)
@@ -1912,11 +1998,6 @@ class DozerPoolManager(Blueprint):
             min_amount = Amount(2 ** 256 - 1)
             for token in unvisited:
                 amount, _ = distances[token]
-                # Deterministic selection: primary key is required input amount,
-                # secondary key is the token bytes. A total order makes the result
-                # independent of `unvisited` set iteration order, which is required
-                # for consensus (ties would otherwise be broken by non-deterministic
-                # hash order).
                 if amount < min_amount or (
                     amount == min_amount and current is not None and token < current
                 ):
