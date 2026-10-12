@@ -272,6 +272,11 @@ class NCThothNamerBlueprintTestCase(BlueprintTestCase):
         # Test invalid key format
         with self.assertNCFail('InvalidDataKey'):
             self.runner.call_public_method(self.nc_id, 'update_profile_data', context, name, "invalid@key", "value")
+
+        # Test non-ASCII keys are rejected, including characters whose isalnum() differs across Python versions
+        for non_ascii_key in ["\U0001e4d0", "chave_é", "ключ", "key\u0663"]:
+            with self.assertNCFail('InvalidDataKey'):
+                self.runner.call_public_method(self.nc_id, 'update_profile_data', context, name, non_ascii_key, "value")
             
         # Test too long key
         with self.assertNCFail('InvalidDataKey'):

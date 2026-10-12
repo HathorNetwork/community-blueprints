@@ -737,7 +737,7 @@ class ThothNamer(Blueprint):
         
         Rules:
         - Key must be 1-50 characters
-        - Key must be alphanumeric with underscores
+        - Key must be ASCII alphanumeric with underscores
         - Value must be 1-1000 characters
         - Value must be valid UTF-8
         - No control characters allowed (except newline, tab)
@@ -746,8 +746,8 @@ class ThothNamer(Blueprint):
         if not isinstance(key, str) or not key or len(key) > self.max_profile_key_length:
             raise InvalidDataKey(f'Key must be between 1 and {self.max_profile_key_length} characters')
         
-        # Only allow alphanumeric and underscores in keys
-        if not key.replace('_', '').isalnum():
+        # Only allow ASCII alphanumeric and underscores in keys.
+        if not key.isascii() or not key.replace('_', '').isalnum():
             raise InvalidDataKey('Key must contain only letters, numbers, and underscores')
         
         # Validate value
