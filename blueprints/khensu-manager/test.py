@@ -34,6 +34,10 @@ LRU_CACHE_CAPACITY = 150  # Default LRU cache capacity
 
 INFINITY = INITIAL_TOKEN_RESERVE * DEFAULT_MARKET_CAP
 
+VALID_IMAGE_LINK = (
+    "ipfs://ipfs/bafkreideeo5hfcst4ej4c4madhedmrufjxttu32skkgo6smzn7v72lkju4"
+)
+
 
 class KhensuManagerTestCase(BlueprintTestCase):
     def setUp(self):
@@ -189,10 +193,41 @@ class KhensuManagerTestCase(BlueprintTestCase):
             "",
             "",
             "",
-            "",
+            VALID_IMAGE_LINK,
         )
 
         return token_uid
+
+    def _register_token_with_metadata(
+        self,
+        token_name: str,
+        token_symbol: str,
+        description: str = "",
+        twitter: str = "",
+        telegram: str = "",
+        website: str = "",
+        image_link: str = VALID_IMAGE_LINK,
+    ) -> TokenUid:
+        """Register a new token passing full metadata"""
+        action = NCDepositAction(token_uid=HTR_UID, amount=int(FEE_TOKEN_VALUE))
+
+        ctx = self.create_context(
+            caller_id=self.admin_address,
+            actions=[action],
+        )
+
+        return self.runner.call_public_method(
+            self.manager_id,
+            "register_token",
+            ctx,
+            token_name,
+            token_symbol,
+            description,
+            twitter,
+            telegram,
+            website,
+            image_link,
+        )
 
     def test_initialize(self) -> None:
         """Test basic initialization"""
@@ -261,6 +296,95 @@ class KhensuManagerTestCase(BlueprintTestCase):
         # Try to register the same token again
         with self.assertRaises(NCFail):
             self._register_token("token1", "TK1")
+
+    def test_register_token_metadata_validation(self) -> None:
+        """Test URL and image link validation on register_token"""
+        self._initialize_manager()
+
+        # Valid metadata is stored verbatim
+        token_uid = self._register_token_with_metadata(
+            "token1",
+            "TK1",
+            description="A test token",
+            twitter="https://x.com/khensu",
+            telegram="https://t.me/khensu",
+            website="https://khensu.fun/",
+            image_link=VALID_IMAGE_LINK,
+        )
+        token_info = self.runner.call_view_method(
+            self.manager_id, "get_token_info", token_uid
+        )
+        self.assertEqual(token_info.twitter, "https://x.com/khensu")
+        self.assertEqual(token_info.telegram, "https://t.me/khensu")
+        self.assertEqual(token_info.website, "https://khensu.fun/")
+        self.assertEqual(token_info.image_link, VALID_IMAGE_LINK)
+
+        # Empty social links are allowed
+        self._register_token_with_metadata("token2", "TK2")
+
+        # The image link is required
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata("token3", "TK3", image_link="")
+
+        # Twitter must be from x.com or twitter.com
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", twitter="https://facebook.com/khensu"
+            )
+
+        # A bare prefix with no handle is rejected
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", twitter="https://x.com/"
+            )
+
+        # Telegram must be from t.me or telegram.me
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", telegram="https://x.com/khensu"
+            )
+
+        # Website must use https
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", website="http://khensu.fun/"
+            )
+
+        # URLs are size limited
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", website="https://khensu.fun/" + "a" * 200
+            )
+
+        # URLs may not contain invalid characters
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", website="https://khensu.fun/<script>"
+            )
+
+        # Image link must be an ipfs://ipfs/<hash> URL
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", image_link="https://example.com/image.png"
+            )
+
+        # Image hash must be long enough
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", image_link="ipfs://ipfs/tooshort"
+            )
+
+        # Image link is size limited
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", image_link="ipfs://ipfs/" + "a" * 150
+            )
+
+        # Image hash may not contain invalid characters
+        with self.assertNCFail("InvalidParameters"):
+            self._register_token_with_metadata(
+                "token3", "TK3", image_link="ipfs://ipfs/" + "a" * 31 + "/../x"
+            )
 
     def test_buy_tokens(self) -> None:
         """Test buying tokens with HTR"""
@@ -1267,9 +1391,7 @@ class KhensuManagerTestCase(BlueprintTestCase):
             self.blueprint_id_khensu,
             "2.0.0",
         )
-        version = self.runner.call_view_method(
-            self.manager_id, "get_contract_version"
-        )
+        version = self.runner.call_view_method(self.manager_id, "get_contract_version")
         self.assertEqual(version, "2.0.0")
 
     def test_multi_token_management(self) -> None:
